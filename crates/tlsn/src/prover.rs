@@ -38,7 +38,7 @@ use tlsn_core::{
     transcript::{TlsTranscript, Transcript},
 };
 use tlsn_mux::{Handle, Stream};
-use tracing::{Span, debug, info_span, instrument};
+use tracing::{Span, debug, info, info_span, instrument};
 
 const BUF_CAP: usize = 16 * 1024 * 1024;
 
@@ -95,11 +95,13 @@ impl Prover<state::Initialized> {
         mut self,
         config: P,
     ) -> Result<Prover<state::CommitAccepted<P::Commit>>> {
+        info!("PROBE prover.commit: enter");
         let mut ctx = self
             .ctx
             .take()
             .ok_or_else(|| Error::internal().with_msg("commitment protocol context was dropped"))?;
 
+        info!("PROBE prover.commit: sending TlsCommitRequestMsg");
         // Sends protocol configuration to verifier for compatibility check.
         ctx.io_mut()
             .send(TlsCommitRequestMsg {
@@ -112,6 +114,7 @@ impl Prover<state::Initialized> {
                     .with_msg("commitment protocol failed to send request")
                     .with_source(e)
             })?;
+        info!("PROBE prover.commit: sent TlsCommitRequestMsg, awaiting Response");
 
         ctx.io_mut()
             .expect_next::<Response>()
@@ -127,10 +130,13 @@ impl Prover<state::Initialized> {
                     .with_msg("commitment protocol rejected by verifier")
                     .with_source(e)
             })?;
+        info!("PROBE prover.commit: Response received, building deps");
 
         let commit_config: TlsCommitConfig = config.into();
         let mut deps = ProverDeps::new(commit_config, ctx);
+        info!("PROBE prover.commit: calling deps.setup()");
         deps.setup().await?;
+        info!("PROBE prover.commit: deps.setup() returned");
 
         debug!("setup complete");
 

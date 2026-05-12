@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tlsn_core::config::tls_commit::{mpc::MpcTlsConfig, proxy::ProxyTlsConfig};
 use tlsn_deap::Deap;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::{
     Error,
@@ -101,11 +101,13 @@ impl VerifierMpcDeps {
     }
 
     pub(crate) async fn setup(&mut self) -> Result<(), Error> {
+        info!("PROBE verifier.deps.setup: enter");
         let mut keys = self.mpc_tls.alloc().map_err(|e| {
             Error::internal()
                 .with_msg("commitment protocol failed to allocate mpc-tls resources")
                 .with_source(e)
         })?;
+        info!("PROBE verifier.deps.setup: alloc done");
         let vm_lock = self.vm.try_lock().expect("VM is not locked");
         translate_keys(&mut keys, &vm_lock);
         self.keys = Some(keys);
@@ -113,11 +115,13 @@ impl VerifierMpcDeps {
         drop(vm_lock);
 
         debug!("setting up mpc-tls");
+        info!("PROBE verifier.deps.setup: calling mpc_tls.preprocess()");
         self.mpc_tls.preprocess().await.map_err(|e| {
             Error::internal()
                 .with_msg("commitment protocol failed during mpc-tls preprocessing")
                 .with_source(e)
         })?;
+        info!("PROBE verifier.deps.setup: mpc_tls.preprocess() returned");
 
         Ok(())
     }

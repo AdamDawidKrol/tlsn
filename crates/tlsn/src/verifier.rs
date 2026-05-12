@@ -142,19 +142,23 @@ impl<P> Verifier<state::CommitStart<P>> {
     /// Accepts the proposed protocol configuration.
     #[instrument(parent = &self.span, level = "info", skip_all, err)]
     pub async fn accept(mut self) -> Result<Verifier<state::CommitAccepted<P>>> {
+        info!("PROBE verifier.accept: enter");
         let mut ctx = self
             .ctx
             .take()
             .ok_or_else(|| Error::internal().with_msg("commitment protocol context was dropped"))?;
 
+        info!("PROBE verifier.accept: sending Response::ok");
         ctx.io_mut().send(Response::ok()).await.map_err(|e| {
             Error::io()
                 .with_msg("commitment protocol failed to send acceptance")
                 .with_source(e)
         })?;
+        info!("PROBE verifier.accept: Response sent, calling deps.setup()");
 
         let mut deps = VerifierDeps::new(&self.state.config, ctx);
         deps.setup().await?;
+        info!("PROBE verifier.accept: deps.setup() returned");
 
         debug!("setup complete");
 

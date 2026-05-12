@@ -45,7 +45,7 @@ use tlsn_core::{
     transcript::TlsTranscript,
     webpki::CertificateDer,
 };
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 /// MPC-TLS leader.
 #[derive(Debug)]
@@ -187,6 +187,7 @@ impl MpcTlsLeader {
     /// Preprocesses the connection.
     #[instrument(level = "debug", skip_all, err)]
     pub async fn preprocess(&mut self) -> Result<(), MpcTlsError> {
+        info!("PROBE leader.preprocess: enter");
         let State::Setup {
             mut ctx,
             vm,
@@ -207,33 +208,44 @@ impl MpcTlsLeader {
             .try_lock_owned()
             .map_err(|_| MpcTlsError::other("VM lock is held"))?;
 
+        info!("PROBE leader.preprocess: starting try_join3 (ke.setup, record_layer.preprocess, vm.preprocess+flush)");
         let (ke, record_layer, _) = ctx
             .try_join3(
                 async move |ctx| {
-                    ke.setup(ctx)
+                    info!("PROBE leader.preprocess: [ke.setup] start");
+                    let r = ke.setup(ctx)
                         .await
                         .map(|_| ke)
-                        .map_err(MpcTlsError::preprocess)
+                        .map_err(MpcTlsError::preprocess);
+                    info!("PROBE leader.preprocess: [ke.setup] done is_ok={}", r.is_ok());
+                    r
                 },
                 async move |ctx| {
-                    record_layer
+                    info!("PROBE leader.preprocess: [record_layer.preprocess] start");
+                    let r = record_layer
                         .preprocess(ctx)
                         .await
                         .map(|_| record_layer)
-                        .map_err(MpcTlsError::preprocess)
+                        .map_err(MpcTlsError::preprocess);
+                    info!("PROBE leader.preprocess: [record_layer.preprocess] done is_ok={}", r.is_ok());
+                    r
                 },
                 async move |ctx| {
+                    info!("PROBE leader.preprocess: [vm.preprocess] start");
                     vm_lock
                         .preprocess(ctx)
                         .await
                         .map_err(MpcTlsError::preprocess)?;
+                    info!("PROBE leader.preprocess: [vm.preprocess] done, calling vm.flush");
                     vm_lock.flush(ctx).await.map_err(MpcTlsError::preprocess)?;
+                    info!("PROBE leader.preprocess: [vm.flush] done");
 
                     Ok::<_, MpcTlsError>(())
                 },
             )
             .await
             .map_err(MpcTlsError::preprocess)??;
+        info!("PROBE leader.preprocess: try_join3 returned, sending SetClientRandom");
 
         ctx.io_mut()
             .send(Message::SetClientRandom(SetClientRandom {

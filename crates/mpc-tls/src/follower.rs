@@ -25,7 +25,7 @@ use tlsn_core::{
     connection::{CertBinding, CertBindingV1_2, TlsVersion, VerifyData},
     transcript::TlsTranscript,
 };
-use tracing::{debug, instrument};
+use tracing::{debug, info, instrument};
 
 // Maximum handshake time difference in seconds.
 const MAX_TIME_DIFF: u64 = 5;
@@ -157,6 +157,7 @@ impl MpcTlsFollower {
     /// Preprocesses the connection.
     #[instrument(skip_all, err)]
     pub async fn preprocess(&mut self) -> Result<(), MpcTlsError> {
+        info!("PROBE follower.preprocess: enter");
         let State::Setup {
             vm,
             mut ke,
@@ -175,24 +176,34 @@ impl MpcTlsFollower {
                 .clone()
                 .try_lock_owned()
                 .map_err(|_| MpcTlsError::other("VM lock is held"))?;
+            info!("PROBE follower.preprocess: starting try_join3 (ke.setup, record_layer.preprocess, vm.preprocess+flush)");
             self.ctx
                 .try_join3(
                     async move |ctx| {
-                        ke.setup(ctx)
+                        info!("PROBE follower.preprocess: [ke.setup] start");
+                        let r = ke.setup(ctx)
                             .await
                             .map(|_| ke)
-                            .map_err(MpcTlsError::preprocess)
+                            .map_err(MpcTlsError::preprocess);
+                        info!("PROBE follower.preprocess: [ke.setup] done is_ok={}", r.is_ok());
+                        r
                     },
                     async move |ctx| {
-                        record_layer
+                        info!("PROBE follower.preprocess: [record_layer.preprocess] start");
+                        let r = record_layer
                             .preprocess(ctx)
                             .await
                             .map(|_| record_layer)
-                            .map_err(MpcTlsError::preprocess)
+                            .map_err(MpcTlsError::preprocess);
+                        info!("PROBE follower.preprocess: [record_layer.preprocess] done is_ok={}", r.is_ok());
+                        r
                     },
                     async move |ctx| {
+                        info!("PROBE follower.preprocess: [vm.preprocess] start");
                         vm.preprocess(ctx).await.map_err(MpcTlsError::preprocess)?;
+                        info!("PROBE follower.preprocess: [vm.preprocess] done, calling vm.flush");
                         vm.flush(ctx).await.map_err(MpcTlsError::preprocess)?;
+                        info!("PROBE follower.preprocess: [vm.flush] done");
 
                         Ok::<_, MpcTlsError>(())
                     },
@@ -200,6 +211,7 @@ impl MpcTlsFollower {
                 .await
                 .map_err(MpcTlsError::hs)??
         };
+        info!("PROBE follower.preprocess: try_join3 returned");
 
         self.state = State::Ready {
             vm,
