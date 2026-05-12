@@ -208,8 +208,12 @@ impl MpcTlsLeader {
             .try_lock_owned()
             .map_err(|_| MpcTlsError::other("VM lock is held"))?;
 
-        info!("PROBE leader.preprocess: starting try_join3 (ke.setup, record_layer.preprocess, vm.preprocess+flush)");
-        let (ke, record_layer, _) = ctx
+        // Run `vm.flush` after `try_join3` completes. Calling `flush` from inside the
+        // concurrent join raced with the other two sub-contexts on both sides and
+        // could deadlock (see Vouch CI: last PROBE before timeout was
+        // "[vm.preprocess] done, calling vm.flush" with no "[vm.flush] done").
+        info!("PROBE leader.preprocess: starting try_join3 (ke.setup, record_layer.preprocess, vm.preprocess)");
+        let (ke, record_layer, mut vm_lock) = ctx
             .try_join3(
                 async move |ctx| {
                     info!("PROBE leader.preprocess: [ke.setup] start");
@@ -236,16 +240,21 @@ impl MpcTlsLeader {
                         .preprocess(ctx)
                         .await
                         .map_err(MpcTlsError::preprocess)?;
-                    info!("PROBE leader.preprocess: [vm.preprocess] done, calling vm.flush");
-                    vm_lock.flush(ctx).await.map_err(MpcTlsError::preprocess)?;
-                    info!("PROBE leader.preprocess: [vm.flush] done");
-
-                    Ok::<_, MpcTlsError>(())
+                    info!("PROBE leader.preprocess: [vm.preprocess] done");
+                    Ok(vm_lock)
                 },
             )
             .await
             .map_err(MpcTlsError::preprocess)??;
-        info!("PROBE leader.preprocess: try_join3 returned, sending SetClientRandom");
+
+        info!("PROBE leader.preprocess: try_join3 returned, calling vm.flush");
+        vm_lock
+            .flush(&mut ctx)
+            .await
+            .map_err(MpcTlsError::preprocess)?;
+        info!("PROBE leader.preprocess: [vm.flush] done");
+        drop(vm_lock);
+        info!("PROBE leader.preprocess: sending SetClientRandom");
 
         ctx.io_mut()
             .send(Message::SetClientRandom(SetClientRandom {

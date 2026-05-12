@@ -171,47 +171,59 @@ impl MpcTlsFollower {
             return Err(MpcTlsError::state("must be in setup state to preprocess"));
         };
 
-        let (ke, record_layer, _) = {
-            let mut vm = vm
-                .clone()
-                .try_lock_owned()
-                .map_err(|_| MpcTlsError::other("VM lock is held"))?;
-            info!("PROBE follower.preprocess: starting try_join3 (ke.setup, record_layer.preprocess, vm.preprocess+flush)");
-            self.ctx
-                .try_join3(
-                    async move |ctx| {
-                        info!("PROBE follower.preprocess: [ke.setup] start");
-                        let r = ke.setup(ctx)
-                            .await
-                            .map(|_| ke)
-                            .map_err(MpcTlsError::preprocess);
-                        info!("PROBE follower.preprocess: [ke.setup] done is_ok={}", r.is_ok());
-                        r
-                    },
-                    async move |ctx| {
-                        info!("PROBE follower.preprocess: [record_layer.preprocess] start");
-                        let r = record_layer
-                            .preprocess(ctx)
-                            .await
-                            .map(|_| record_layer)
-                            .map_err(MpcTlsError::preprocess);
-                        info!("PROBE follower.preprocess: [record_layer.preprocess] done is_ok={}", r.is_ok());
-                        r
-                    },
-                    async move |ctx| {
-                        info!("PROBE follower.preprocess: [vm.preprocess] start");
-                        vm.preprocess(ctx).await.map_err(MpcTlsError::preprocess)?;
-                        info!("PROBE follower.preprocess: [vm.preprocess] done, calling vm.flush");
-                        vm.flush(ctx).await.map_err(MpcTlsError::preprocess)?;
-                        info!("PROBE follower.preprocess: [vm.flush] done");
+        let mut vm_lock = vm
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| MpcTlsError::other("VM lock is held"))?;
 
-                        Ok::<_, MpcTlsError>(())
-                    },
-                )
-                .await
-                .map_err(MpcTlsError::hs)??
-        };
-        info!("PROBE follower.preprocess: try_join3 returned");
+        info!("PROBE follower.preprocess: starting try_join3 (ke.setup, record_layer.preprocess, vm.preprocess)");
+        let (ke, record_layer, vm_lock_back) = self
+            .ctx
+            .try_join3(
+                async move |ctx| {
+                    info!("PROBE follower.preprocess: [ke.setup] start");
+                    let r = ke
+                        .setup(ctx)
+                        .await
+                        .map(|_| ke)
+                        .map_err(MpcTlsError::preprocess);
+                    info!("PROBE follower.preprocess: [ke.setup] done is_ok={}", r.is_ok());
+                    r
+                },
+                async move |ctx| {
+                    info!("PROBE follower.preprocess: [record_layer.preprocess] start");
+                    let r = record_layer
+                        .preprocess(ctx)
+                        .await
+                        .map(|_| record_layer)
+                        .map_err(MpcTlsError::preprocess);
+                    info!(
+                        "PROBE follower.preprocess: [record_layer.preprocess] done is_ok={}",
+                        r.is_ok()
+                    );
+                    r
+                },
+                async move |ctx| {
+                    info!("PROBE follower.preprocess: [vm.preprocess] start");
+                    vm_lock
+                        .preprocess(ctx)
+                        .await
+                        .map_err(MpcTlsError::preprocess)?;
+                    info!("PROBE follower.preprocess: [vm.preprocess] done");
+                    Ok(vm_lock)
+                },
+            )
+            .await
+            .map_err(MpcTlsError::hs)??;
+
+        let mut vm_lock = vm_lock_back;
+        info!("PROBE follower.preprocess: try_join3 returned, calling vm.flush");
+        vm_lock
+            .flush(&mut self.ctx)
+            .await
+            .map_err(MpcTlsError::preprocess)?;
+        info!("PROBE follower.preprocess: [vm.flush] done");
+        drop(vm_lock);
 
         self.state = State::Ready {
             vm,
