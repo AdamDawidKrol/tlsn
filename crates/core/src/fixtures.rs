@@ -114,11 +114,16 @@ impl ConnectionFixture {
     }
 
     /// Returns the server_ephemeral_key fixture.
+    ///
+    /// The fixtures are TLS 1.2, so the binding is always [`CertBinding::V1_2`].
     pub fn server_ephemeral_key(&self) -> &ServerEphemKey {
         let CertBinding::V1_2(CertBindingV1_2 {
             server_ephemeral_key,
             ..
-        }) = &self.server_cert_data.binding;
+        }) = &self.server_cert_data.binding
+        else {
+            panic!("connection fixtures are TLS 1.2");
+        };
         server_ephemeral_key
     }
 }

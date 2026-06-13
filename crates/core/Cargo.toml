@@ -17,8 +17,6 @@ mozilla-certs = ["dep:webpki-root-certs", "dep:webpki-roots"]
 fixtures = [
     "dep:hex",
     "dep:tlsn-data-fixtures",
-    "dep:aead",
-    "dep:aes-gcm",
     "dep:generic-array",
 ]
 
@@ -28,8 +26,11 @@ tlsn-tls-core = { workspace = true, features = ["serde"] }
 
 rangeset = { workspace = true, features = ["serde"] }
 
-aead = { workspace = true, features = ["alloc"], optional = true }
-aes-gcm = { workspace = true, optional = true }
+# `aead`/`aes-gcm`/`hmac` back the cleartext TLS 1.3 handshake decrypt/verify
+# path (`transcript::tls::tls13`); they used to be `fixtures`-only.
+aead = { workspace = true, features = ["alloc"] }
+aes-gcm = { workspace = true }
+hmac = { workspace = true }
 generic-array = { workspace = true, optional = true }
 const-oid = { workspace = true }
 bimap = { version = "0.6", features = ["serde"] }
@@ -55,8 +56,6 @@ itybity = { workspace = true }
 zeroize = { workspace = true, features = ["zeroize_derive"] }
 
 [dev-dependencies]
-aead = { workspace = true, features = ["alloc"] }
-aes-gcm = { workspace = true }
 generic-array = { workspace = true }
 bincode = { workspace = true }
 hex = { workspace = true }

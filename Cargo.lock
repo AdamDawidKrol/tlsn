@@ -6010,6 +6010,7 @@ dependencies = [
  "const-oid 0.10.2",
  "generic-array",
  "hex",
+ "hmac",
  "itybity 0.2.1",
  "opaque-debug",
  "rand 0.9.4",

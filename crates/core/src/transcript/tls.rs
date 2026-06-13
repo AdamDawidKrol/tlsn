@@ -9,6 +9,7 @@ use crate::{
 use sha2::{Digest, Sha256};
 
 mod builder;
+mod tls13;
 pub use builder::TlsTranscriptBuilder;
 
 /// A transcript of TLS records sent and received by the prover.
@@ -77,13 +78,27 @@ impl TlsTranscript {
     }
 
     /// Returns the client finished record.
+    ///
+    /// **TLS 1.2 only.** In TLS 1.2 the encrypted client Finished record sits
+    /// at `sent[0]`. TLS 1.3 fully verifies the handshake flight in the clear
+    /// (parent spec §6.2), so the Finished records are not present in
+    /// `sent`/`recv` — calling this on a 1.3 transcript returns the first
+    /// application-epoch record, which is not a Finished record.
     pub fn client_finished(&self) -> &Record {
+        debug_assert_eq!(
+            self.version,
+            TlsVersion::V1_2,
+            "client_finished() is TLS 1.2 only; transcript version is {:?}",
+            self.version
+        );
         self.sent()
             .first()
             .expect("client finished record should be present")
     }
 
     /// Returns the client finished verify data.
+    ///
+    /// **TLS 1.2 only** (see [`Self::client_finished`]).
     pub fn cf_vd(&self) -> Option<&[u8]> {
         let cf = self.client_finished();
 
@@ -92,13 +107,23 @@ impl TlsTranscript {
     }
 
     /// Returns the server finished record.
+    ///
+    /// **TLS 1.2 only** (see [`Self::client_finished`]).
     pub fn server_finished(&self) -> &Record {
+        debug_assert_eq!(
+            self.version,
+            TlsVersion::V1_2,
+            "server_finished() is TLS 1.2 only; transcript version is {:?}",
+            self.version
+        );
         self.recv()
             .first()
             .expect("server finished record should be present")
     }
 
     /// Returns the server finished verify data.
+    ///
+    /// **TLS 1.2 only** (see [`Self::client_finished`]).
     pub fn sf_vd(&self) -> Option<&[u8]> {
         let sf = self.server_finished();
 
@@ -107,6 +132,9 @@ impl TlsTranscript {
     }
 
     /// Returns the client finished hash.
+    ///
+    /// **TLS 1.2 only**; `None` for TLS 1.3 (the 1.3 key schedule uses
+    /// `h2`/`h3` instead of `cf_hash`/`session_hash`/`sf_hash`).
     pub fn cf_hash(&self) -> Option<[u8; 32]> {
         self.cf_hash.as_ref().copied()
     }
@@ -116,12 +144,16 @@ impl TlsTranscript {
     /// The session hash is the SHA-256 digest over the handshake messages
     /// from ClientHello up to and including ClientKeyExchange (RFC 7627).
     /// It is used to derive the extended master secret.
+    ///
+    /// **TLS 1.2 only**; `None` for TLS 1.3.
     pub fn session_hash(&self) -> Option<[u8; 32]> {
         self.session_hash.as_ref().copied()
     }
 
     /// Returns the server finished hash given the client finished verify
     /// data.
+    ///
+    /// **TLS 1.2 only**; `None` for TLS 1.3.
     pub fn sf_hash(&self, cf_vd: &[u8; 12]) -> Option<[u8; 32]> {
         let sf_hash = self.sf_hash.as_ref()?;
         let SfHashInput {
@@ -265,6 +297,10 @@ impl TlsTranscriptError {
     fn validation(msg: impl Into<String>) -> Self {
         Self(ErrorRepr::Validation(msg.into()))
     }
+
+    fn crypto(msg: impl Into<String>) -> Self {
+        Self(ErrorRepr::Crypto(msg.into()))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -277,4 +313,6 @@ pub(crate) enum ErrorRepr {
     Incomplete { direction: Direction, seq: u64 },
     #[error("validation error: {0}")]
     Validation(String),
+    #[error("crypto error: {0}")]
+    Crypto(String),
 }

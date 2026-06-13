@@ -268,18 +268,45 @@ pub struct CertBindingV1_2 {
     pub server_ephemeral_key: ServerEphemKey,
 }
 
+/// TLS 1.3 CertificateVerify signature scheme (the two we support).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureScheme13 {
+    /// `ecdsa_secp256r1_sha256` (0x0403).
+    EcdsaSecp256r1Sha256,
+    /// `rsa_pss_rsae_sha256` (0x0804).
+    RsaPssRsaeSha256,
+}
+
+/// TLS 1.3 certificate binding.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CertBindingV1_3 {
+    /// Transcript hash H(ClientHello .. Certificate) — the input the server
+    /// signs in CertificateVerify (RFC 8446 §4.4.3).
+    pub cv_transcript_hash: [u8; 32],
+    /// Signature scheme used in CertificateVerify.
+    pub sig_scheme: SignatureScheme13,
+}
+
 /// TLS certificate binding.
 ///
 /// This is the data that the server signs using its public key in the
 /// certificate it presents during the TLS handshake. This provides a binding
 /// between the server's identity and the ephemeral keys used to authenticate
 /// the TLS session.
+///
+/// In TLS 1.2 the server signs the randoms and the ephemeral key exchange
+/// parameters ([`CertBinding::V1_2`]). In TLS 1.3 the server signs the running
+/// handshake transcript hash in CertificateVerify ([`CertBinding::V1_3`]); the
+/// ephemeral key does not participate in authentication.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum CertBinding {
     /// TLS 1.2 certificate binding.
     V1_2(CertBindingV1_2),
+    /// TLS 1.3 certificate binding.
+    V1_3(CertBindingV1_3),
 }
 
 /// TLS handshake data.
@@ -296,33 +323,49 @@ pub struct HandshakeData {
 impl HandshakeData {
     /// Verifies the handshake data.
     ///
+    /// Dispatches on [`CertBinding`]: TLS 1.2 verifies the ServerKeyExchange
+    /// signature over the randoms and ephemeral key, TLS 1.3 verifies the
+    /// CertificateVerify signature over the handshake transcript hash.
+    ///
     /// # Arguments
     ///
-    /// * `verifier` - Cerificate verifier.
+    /// * `verifier` - Certificate verifier.
     /// * `time` - The time of the connection.
-    /// * `server_ephemeral_key` - The server's ephemeral key.
+    /// * `server_ephemeral_key` - The server's ephemeral key. Required for TLS
+    ///   1.2 (the signature covers it); ignored for TLS 1.3 (authentication is
+    ///   the CertificateVerify signature over the transcript, not the key
+    ///   exchange parameters). Accepts a bare `&ServerEphemKey`, `Some(&key)`,
+    ///   or `None`.
     /// * `server_name` - The server name.
-    pub fn verify(
+    pub fn verify<'k>(
         &self,
         verifier: &ServerCertVerifier,
         time: u64,
-        server_ephemeral_key: &ServerEphemKey,
+        server_ephemeral_key: impl Into<Option<&'k ServerEphemKey>>,
         server_name: &ServerName,
     ) -> Result<(), HandshakeVerificationError> {
-        #[allow(irrefutable_let_patterns)]
-        let CertBinding::V1_2(CertBindingV1_2 {
-            client_random,
-            server_random,
-            server_ephemeral_key: expected_server_ephemeral_key,
-        }) = &self.binding
-        else {
-            unreachable!("only TLS 1.2 is implemented")
-        };
-
-        if server_ephemeral_key != expected_server_ephemeral_key {
-            return Err(HandshakeVerificationError::InvalidServerEphemeralKey);
+        let server_ephemeral_key = server_ephemeral_key.into();
+        match &self.binding {
+            CertBinding::V1_2(binding) => {
+                let server_ephemeral_key =
+                    server_ephemeral_key.ok_or(HandshakeVerificationError::MissingEphemeralKey)?;
+                self.verify_v1_2(verifier, time, server_ephemeral_key, server_name, binding)
+            }
+            CertBinding::V1_3(binding) => self.verify_v1_3(verifier, time, server_name, binding),
         }
+    }
 
+    /// Verifies the cert chain to a trusted root at `time` for `server_name`.
+    ///
+    /// The end-entity [`webpki::EndEntityCert`] borrows the caller-owned DER, so
+    /// it is constructed by each caller (see [`Self::end_entity_cert`]) rather
+    /// than returned from here.
+    fn verify_cert_chain(
+        &self,
+        verifier: &ServerCertVerifier,
+        time: u64,
+        server_name: &ServerName,
+    ) -> Result<(), HandshakeVerificationError> {
         let (end_entity, intermediates) = self
             .certs
             .split_first()
@@ -333,6 +376,47 @@ impl HandshakeData {
         verifier
             .verify_server_cert(end_entity, intermediates, server_name, time)
             .map_err(HandshakeVerificationError::ServerCert)?;
+
+        Ok(())
+    }
+
+    /// Borrows the end-entity certificate (`certs[0]`) DER for parsing into a
+    /// [`webpki::EndEntityCert`]. The returned value owns the DER reference,
+    /// so callers keep it alive while verifying the signature.
+    fn end_entity_der(
+        &self,
+    ) -> Result<webpki_types::CertificateDer<'_>, HandshakeVerificationError> {
+        let end_entity = self
+            .certs
+            .first()
+            .ok_or(HandshakeVerificationError::MissingCerts)?;
+        Ok(webpki_types::CertificateDer::from(end_entity.0.as_slice()))
+    }
+
+    /// TLS 1.2: verify the ServerKeyExchange signature over
+    /// `client_random || server_random || kx_params`.
+    fn verify_v1_2(
+        &self,
+        verifier: &ServerCertVerifier,
+        time: u64,
+        server_ephemeral_key: &ServerEphemKey,
+        server_name: &ServerName,
+        binding: &CertBindingV1_2,
+    ) -> Result<(), HandshakeVerificationError> {
+        let CertBindingV1_2 {
+            client_random,
+            server_random,
+            server_ephemeral_key: expected_server_ephemeral_key,
+        } = binding;
+
+        if server_ephemeral_key != expected_server_ephemeral_key {
+            return Err(HandshakeVerificationError::InvalidServerEphemeralKey);
+        }
+
+        self.verify_cert_chain(verifier, time, server_name)?;
+        let end_entity_der = self.end_entity_der()?;
+        let end_entity = webpki::EndEntityCert::try_from(&end_entity_der)
+            .map_err(|_| HandshakeVerificationError::InvalidEndEntityCertificate)?;
 
         // Verify the signature matches the certificate and key exchange parameters.
         let mut message = Vec::new();
@@ -361,9 +445,52 @@ impl HandshakeData {
             }
         };
 
-        let end_entity = webpki_types::CertificateDer::from(end_entity.0.as_slice());
-        let end_entity = webpki::EndEntityCert::try_from(&end_entity)
+        end_entity
+            .verify_signature(sig_alg, &message, &self.sig.sig)
+            .map_err(|_| HandshakeVerificationError::InvalidServerSignature)?;
+
+        Ok(())
+    }
+
+    /// TLS 1.3: verify the CertificateVerify signature over the reconstructed
+    /// signed message (RFC 8446 §4.4.3).
+    fn verify_v1_3(
+        &self,
+        verifier: &ServerCertVerifier,
+        time: u64,
+        server_name: &ServerName,
+        binding: &CertBindingV1_3,
+    ) -> Result<(), HandshakeVerificationError> {
+        self.verify_cert_chain(verifier, time, server_name)?;
+        let end_entity_der = self.end_entity_der()?;
+        let end_entity = webpki::EndEntityCert::try_from(&end_entity_der)
             .map_err(|_| HandshakeVerificationError::InvalidEndEntityCertificate)?;
+
+        // Reconstruct the CertificateVerify signed message (RFC 8446 §4.4.3):
+        //   64 * 0x20 || "TLS 1.3, server CertificateVerify" || 0x00 || hash.
+        let mut message = Vec::with_capacity(64 + 33 + 1 + 32);
+        message.extend_from_slice(&[0x20; 64]);
+        message.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        message.push(0x00);
+        message.extend_from_slice(&binding.cv_transcript_hash);
+
+        // The scheme is taken from the binding, which is authoritative for 1.3
+        // (`ServerSignature.alg` is only informational here).
+        //
+        // `rsa_pss_rsae_sha256` signs with RSA-PSS over a certificate whose
+        // SubjectPublicKeyInfo uses the `rsaEncryption` OID (the "rsae" key
+        // type). In `rustls-webpki` that pairing is exactly the
+        // `RSA_PSS_*_LEGACY_KEY` algorithm (`public_key_alg_id =
+        // rsaEncryption`, `signature_alg_id = RSA_PSS_SHA256`); the crate has
+        // no separate non-legacy `RSA_PSS_2048_8192_SHA256` constant. The
+        // non-`LEGACY_KEY` PSS algorithms (for `id-RSASSA-PSS` keys, i.e.
+        // `rsa_pss_pss_*`) are not provided by this webpki version, so they are
+        // not supported here.
+        use webpki::ring as alg;
+        let sig_alg = match binding.sig_scheme {
+            SignatureScheme13::EcdsaSecp256r1Sha256 => alg::ECDSA_P256_SHA256,
+            SignatureScheme13::RsaPssRsaeSha256 => alg::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+        };
 
         end_entity
             .verify_signature(sig_alg, &message, &self.sig.sig)
@@ -385,6 +512,8 @@ pub enum HandshakeVerificationError {
     InvalidServerSignature,
     #[error("invalid server ephemeral key")]
     InvalidServerEphemeralKey,
+    #[error("missing server ephemeral key (required for TLS 1.2 verification)")]
+    MissingEphemeralKey,
     #[error("server certificate verification failed: {0}")]
     ServerCert(ServerCertVerifierError),
 }
@@ -583,7 +712,10 @@ mod tests {
         #[case] mut data: ConnectionFixture,
     ) {
         let CertBinding::V1_2(CertBindingV1_2 { client_random, .. }) =
-            &mut data.server_cert_data.binding;
+            &mut data.server_cert_data.binding
+        else {
+            panic!("connection fixtures are TLS 1.2");
+        };
         client_random[31] = client_random[31].wrapping_add(1);
 
         let err = data.server_cert_data.verify(
@@ -689,6 +821,90 @@ mod tests {
         assert!(matches!(
             err.unwrap_err(),
             HandshakeVerificationError::MissingCerts
+        ));
+    }
+
+    /// TLS 1.2 verification requires the ephemeral key (the signature covers
+    /// it); `None` is rejected up front before any crypto.
+    #[rstest]
+    #[case::tlsnotary(tlsnotary())]
+    #[case::appliedzkp(appliedzkp())]
+    fn test_verify_v1_2_missing_ephemeral_key(
+        verifier: &ServerCertVerifier,
+        #[case] data: ConnectionFixture,
+    ) {
+        let err = data.server_cert_data.verify(
+            verifier,
+            data.connection_info.time,
+            None,
+            &data.server_name,
+        );
+
+        assert!(matches!(
+            err.unwrap_err(),
+            HandshakeVerificationError::MissingEphemeralKey
+        ));
+    }
+
+    /// A TLS 1.3 ([`CertBinding::V1_3`]) handshake dispatches to the 1.3 path:
+    /// it does not require an ephemeral key (so `None` is fine) and instead
+    /// fails downstream — here at the (empty) certificate chain.
+    #[rstest]
+    #[case::tlsnotary(tlsnotary())]
+    #[case::appliedzkp(appliedzkp())]
+    fn test_verify_v1_3_dispatch_ignores_ephemeral_key(
+        verifier: &ServerCertVerifier,
+        #[case] mut data: ConnectionFixture,
+    ) {
+        data.server_cert_data.binding = CertBinding::V1_3(CertBindingV1_3 {
+            cv_transcript_hash: [0u8; 32],
+            sig_scheme: SignatureScheme13::RsaPssRsaeSha256,
+        });
+        data.server_cert_data.certs = Vec::new();
+
+        // `None` ephemeral key must NOT short-circuit for 1.3; the error is the
+        // missing certificate chain, proving the 1.3 arm ran.
+        let err = data.server_cert_data.verify(
+            verifier,
+            data.connection_info.time,
+            None,
+            &data.server_name,
+        );
+
+        assert!(matches!(
+            err.unwrap_err(),
+            HandshakeVerificationError::MissingCerts
+        ));
+    }
+
+    /// A TLS 1.3 handshake with a valid chain but a signature that does not
+    /// cover the binding's transcript hash fails signature verification (not
+    /// the chain), exercising the full 1.3 verify path.
+    #[rstest]
+    #[case::tlsnotary(tlsnotary())]
+    #[case::appliedzkp(appliedzkp())]
+    fn test_verify_v1_3_bad_signature(
+        verifier: &ServerCertVerifier,
+        #[case] mut data: ConnectionFixture,
+    ) {
+        // Keep the real (valid) certificate chain but swap in a 1.3 binding;
+        // the fixtures' signature is a 1.2 signature over different data, so
+        // the reconstructed CertificateVerify message will not verify.
+        data.server_cert_data.binding = CertBinding::V1_3(CertBindingV1_3 {
+            cv_transcript_hash: [0x42u8; 32],
+            sig_scheme: SignatureScheme13::RsaPssRsaeSha256,
+        });
+
+        let err = data.server_cert_data.verify(
+            verifier,
+            data.connection_info.time,
+            None,
+            &data.server_name,
+        );
+
+        assert!(matches!(
+            err.unwrap_err(),
+            HandshakeVerificationError::InvalidServerSignature
         ));
     }
 }
