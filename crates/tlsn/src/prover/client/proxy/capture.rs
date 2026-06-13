@@ -490,10 +490,22 @@ mod tests {
             handshake_secret,
             client_hs_traffic_secret,
             server_hs_traffic_secret,
+            client_ap_traffic_secret,
+            server_ap_traffic_secret,
         } = captured
         else {
             panic!("expected a TLS 1.3 capture");
         };
+
+        // The application traffic secrets (`CLIENT/SERVER_TRAFFIC_SECRET_0`)
+        // must also be captured: the prover decrypts the app-epoch records with
+        // them to recover the per-record framing (metadata-channel spec §1).
+        // They are derived from the (later) master secret, so they are non-zero
+        // and distinct from the handshake traffic secrets.
+        assert_ne!(client_ap_traffic_secret, [0u8; 32]);
+        assert_ne!(server_ap_traffic_secret, [0u8; 32]);
+        assert_ne!(client_ap_traffic_secret, client_hs_traffic_secret);
+        assert_ne!(server_ap_traffic_secret, server_hs_traffic_secret);
 
         // --- pull h2 (the "c hs traffic" expansion context) from the log ----
         let log = lease.log();

@@ -21,15 +21,23 @@ pub(crate) enum CapturedSecrets {
     /// TLS 1.2: the 48-byte master secret (`CLIENT_RANDOM`).
     V1_2 { ms: [u8; 48] },
     /// TLS 1.3: the `handshake_secret` (recovered via the capturing HKDF
-    /// provider) plus the two handshake traffic secrets (from the `KeyLog`).
+    /// provider) plus the handshake *and* application traffic secrets (from
+    /// the `KeyLog`).
     ///
     /// Consumed by the TLS 1.3 finalize flow (`specs/tls13-proxy.md` §8): the
     /// `handshake_secret` is the private input to the ZK key schedule and the
-    /// two traffic secrets are asserted against its publicly-decoded outputs.
+    /// two handshake traffic secrets are asserted against its publicly-decoded
+    /// outputs. The two application traffic secrets (`CLIENT/SERVER_TRAFFIC_
+    /// SECRET_0`) let the prover decrypt the application-epoch records to
+    /// recover their inner plaintexts and frame them (parent metadata-channel
+    /// spec §1); they are the prover's own cleartext framing input and never
+    /// enter the ZK proof (which uses the ZK-derived application keys).
     V1_3 {
         handshake_secret: [u8; 32],
         client_hs_traffic_secret: [u8; 32],
         server_hs_traffic_secret: [u8; 32],
+        client_ap_traffic_secret: [u8; 32],
+        server_ap_traffic_secret: [u8; 32],
     },
 }
 
@@ -41,6 +49,10 @@ struct KeyLogSecrets {
     client_hs: Option<Vec<u8>>,
     /// TLS 1.3 server handshake traffic secret.
     server_hs: Option<Vec<u8>>,
+    /// TLS 1.3 client application traffic secret (`CLIENT_TRAFFIC_SECRET_0`).
+    client_ap: Option<Vec<u8>>,
+    /// TLS 1.3 server application traffic secret (`SERVER_TRAFFIC_SECRET_0`).
+    server_ap: Option<Vec<u8>>,
 }
 
 /// Captures the secrets of one proxy-mode connection.
@@ -79,6 +91,8 @@ impl SecretLog {
         if secrets.client_hs.is_some() || secrets.server_hs.is_some() {
             let client_hs_traffic_secret = to_array(secrets.client_hs.as_deref(), "client_hs")?;
             let server_hs_traffic_secret = to_array(secrets.server_hs.as_deref(), "server_hs")?;
+            let client_ap_traffic_secret = to_array(secrets.client_ap.as_deref(), "client_ap")?;
+            let server_ap_traffic_secret = to_array(secrets.server_ap.as_deref(), "server_ap")?;
             let handshake_secret = self
                 .capture
                 .lock()
@@ -92,6 +106,8 @@ impl SecretLog {
                 handshake_secret,
                 client_hs_traffic_secret,
                 server_hs_traffic_secret,
+                client_ap_traffic_secret,
+                server_ap_traffic_secret,
             });
         }
 
@@ -118,6 +134,8 @@ impl KeyLog for SecretLog {
             "CLIENT_RANDOM" => secrets.ms = Some(secret.to_vec()),
             "CLIENT_HANDSHAKE_TRAFFIC_SECRET" => secrets.client_hs = Some(secret.to_vec()),
             "SERVER_HANDSHAKE_TRAFFIC_SECRET" => secrets.server_hs = Some(secret.to_vec()),
+            "CLIENT_TRAFFIC_SECRET_0" => secrets.client_ap = Some(secret.to_vec()),
+            "SERVER_TRAFFIC_SECRET_0" => secrets.server_ap = Some(secret.to_vec()),
             _ => {}
         }
     }
@@ -125,7 +143,11 @@ impl KeyLog for SecretLog {
     fn will_log(&self, label: &str) -> bool {
         matches!(
             label,
-            "CLIENT_RANDOM" | "CLIENT_HANDSHAKE_TRAFFIC_SECRET" | "SERVER_HANDSHAKE_TRAFFIC_SECRET"
+            "CLIENT_RANDOM"
+                | "CLIENT_HANDSHAKE_TRAFFIC_SECRET"
+                | "SERVER_HANDSHAKE_TRAFFIC_SECRET"
+                | "CLIENT_TRAFFIC_SECRET_0"
+                | "SERVER_TRAFFIC_SECRET_0"
         )
     }
 }

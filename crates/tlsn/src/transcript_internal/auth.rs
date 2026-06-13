@@ -13,12 +13,26 @@ use mpz_memory_core::{
 };
 use mpz_vm_core::{Call, CallableExt, Vm};
 use rangeset::{iter::RangeIterator, ops::Set, set::RangeSet};
-use tlsn_core::transcript::Record;
+use tlsn_core::transcript::{ContentType, Record};
 
 use crate::transcript_internal::ReferenceMap;
 
 /// The TLS 1.3 application-data inner content type (RFC 8446 §5.1).
 const APPLICATION_DATA: u8 = 0x17;
+
+/// The TLS 1.3 inner content-type byte for a [`ContentType`] (RFC 8446 §5.1).
+/// Used to derive each record's declared suffix type byte (parent
+/// metadata-channel spec §4).
+fn content_type_byte(typ: ContentType) -> u8 {
+    match typ {
+        ContentType::ChangeCipherSpec => 0x14,
+        ContentType::Alert => 0x15,
+        ContentType::Handshake => 0x16,
+        ContentType::ApplicationData => 0x17,
+        ContentType::Heartbeat => 0x18,
+        ContentType::Unknown(id) => id,
+    }
+}
 /// AES-CTR counter for the first keystream block (J0 = 1 is reserved for the
 /// GHASH tag in both TLS 1.2 and 1.3, RFC 5288 / RFC 8446 §5.3).
 const START_CTR: u32 = 2;
@@ -204,8 +218,9 @@ pub(crate) fn verify_plaintext<'a>(
         // The decoded in-VM ciphertext (content XOR keystream plus, for TLS 1.3,
         // the public `type || padding` suffix XOR keystream) is compared against
         // the wire ciphertext in record-ciphertext coordinates. A suffix whose
-        // type byte is not `0x17`, whose padding is non-zero, or whose content
-        // boundary the prover misdeclared therefore fails as `InvalidPlaintext`.
+        // type byte differs from the record's declared inner type, whose padding
+        // is non-zero, or whose content boundary the prover misdeclared
+        // therefore fails as `InvalidPlaintext` (locked classification, §5).
         let mut ciphertexts = Vec::new();
         for (range, chunk) in ciphertext_map.iter() {
             ciphertexts.push((
@@ -269,40 +284,58 @@ fn build_cipher_refs(
     let mut t_base = 0;
     let mut c_base = 0;
     for record in records {
-        // Content lives at the start of the inner plaintext, so a transcript
-        // offset `o` maps to record-ciphertext offset `o` within the record.
-        for (range, _) in plaintext_refs.iter() {
-            let start = range.start.max(t_base);
-            let end = range.end.min(t_base + record.content_len);
-            if start < end {
-                let slice = plaintext_refs
-                    .get(start..end)
-                    .expect("content range is within an allocated reference");
-                entries.push((c_base + (start - t_base), slice));
+        // Only application-data records contribute content to the transcript
+        // coordinate space (`plaintext_refs`); non-app-data records (NST /
+        // KeyUpdate / alert, parent spec §5) keep their content blind and only
+        // have their `type || padding` suffix proven, so `t_base` does not
+        // advance for them.
+        if record.is_app_data {
+            // Content lives at the start of the inner plaintext, so a transcript
+            // offset `o` maps to record-ciphertext offset `o` within the record.
+            for (range, _) in plaintext_refs.iter() {
+                let start = range.start.max(t_base);
+                let end = range.end.min(t_base + record.content_len);
+                if start < end {
+                    let slice = plaintext_refs
+                        .get(start..end)
+                        .expect("content range is within an allocated reference");
+                    entries.push((c_base + (start - t_base), slice));
+                }
             }
+            t_base += record.content_len;
         }
 
-        // The trailing `type || padding` suffix is public and always proven.
+        // The trailing `type || padding` suffix is public and always proven,
+        // for *every* app-epoch record (locked classification, parent spec §5):
+        // the declared inner type is pinned by the suffix matching the wire
+        // ciphertext.
         let suffix_len = record.inner_len - record.content_len;
         if suffix_len > 0 {
-            let suffix = alloc_suffix(vm, suffix_len)?;
+            let suffix = alloc_suffix(vm, suffix_len, record.inner_type)?;
             entries.push((c_base + record.content_len, suffix));
         }
 
-        t_base += record.content_len;
         c_base += record.inner_len;
     }
 
     Ok(ReferenceMap::from_iter(entries))
 }
 
-/// Allocates and publicly assigns a TLS 1.3 record suffix `0x17 || 0x00*p`
-/// (inner type `application_data` followed by zero padding).
-fn alloc_suffix(vm: &mut dyn Vm<Binary>, len: usize) -> Result<Vector<U8>, PlaintextAuthError> {
+/// Allocates and publicly assigns a TLS 1.3 record suffix `inner_type ||
+/// 0x00*p` (the declared inner content type followed by zero padding, parent
+/// spec §4). `inner_type` is `0x17` for application data, `0x16` for a
+/// NewSessionTicket/KeyUpdate, `0x15` for an alert, etc. A mis-declared type
+/// (or a content boundary that places this byte over real content/padding)
+/// makes the disclosed suffix fail to match the wire ciphertext.
+fn alloc_suffix(
+    vm: &mut dyn Vm<Binary>,
+    len: usize,
+    inner_type: u8,
+) -> Result<Vector<U8>, PlaintextAuthError> {
     let suffix = vm.alloc_vec::<U8>(len).map_err(PlaintextAuthError::vm)?;
     vm.mark_public(suffix).map_err(PlaintextAuthError::vm)?;
     let mut bytes = vec![0u8; len];
-    bytes[0] = APPLICATION_DATA;
+    bytes[0] = inner_type;
     vm.assign(suffix, bytes).map_err(PlaintextAuthError::vm)?;
     vm.commit(suffix).map_err(PlaintextAuthError::vm)?;
 
@@ -534,24 +567,31 @@ struct RecordParams {
     /// 1.3: `inner_len - 1 - padding`, i.e. the inner plaintext minus the
     /// 1-byte content type and trailing zero padding.
     content_len: usize,
+    /// TLS 1.3 inner content-type byte assigned to this record's suffix (parent
+    /// spec §4). `0x17` for TLS 1.2 (the suffix path is 1.3-only).
+    inner_type: u8,
+    /// Whether this record's content belongs to the application transcript
+    /// (TLS 1.3 `application_data`, and always `true` for TLS 1.2).
+    /// Non-app-data records (NST / KeyUpdate / alert) contribute no
+    /// transcript content; only their `type || padding` suffix is proven
+    /// (parent spec §5).
+    is_app_data: bool,
 }
 
 impl RecordParams {
-    /// Builds [`RecordParams`] from the app-data record list.
+    /// Builds [`RecordParams`] from the app-epoch record list.
     ///
     /// `content_len` determination:
     /// * TLS 1.2: there is no inner type/padding, so `content_len ==
     ///   inner_len`.
-    /// * TLS 1.3 prover: the content length is known from the decrypted content
-    ///   (`record.plaintext`).
-    /// * TLS 1.3 verifier: `record.plaintext` is absent; the content boundary
-    ///   is public metadata conveyed by the prover (the padding length, parent
-    ///   §10 open-question 5) and is *validated* by the `type || padding`
-    ///   suffix proof — a misdeclared boundary makes the disclosed suffix fail
-    ///   to match the wire ciphertext. Threading that metadata through the
-    ///   finalize flow is the item-9 fixture work; until then the verifier
-    ///   falls back to `inner_len` and 1.3 is exercised via the unit tests that
-    ///   construct [`RecordParams`] directly.
+    /// * TLS 1.3: prefer the framed [`Record::content_len`] (set by the prover
+    ///   from the decrypted content, and by the verifier from the prover-
+    ///   declared metadata — validated by the suffix proof). Fall back to the
+    ///   decrypted `record.plaintext` length, then to `inner_len`.
+    ///
+    /// `inner_type`/`is_app_data` are derived from the framed [`Record::typ`]
+    /// (the proven inner type, parent spec §5). For TLS 1.2 every record is
+    /// treated as application data and the suffix path is unused.
     fn from_records<'a>(
         cipher: &CipherParams,
         records: impl IntoIterator<Item = &'a Record>,
@@ -559,16 +599,26 @@ impl RecordParams {
         let is_v1_3 = cipher.is_v1_3();
         records.into_iter().map(move |record| {
             let inner_len = record.ciphertext.len();
-            let content_len = if is_v1_3 {
-                record.plaintext.as_ref().map_or(inner_len, |p| p.len())
+            let (content_len, inner_type, is_app_data) = if is_v1_3 {
+                let content_len = record
+                    .content_len
+                    .or_else(|| record.plaintext.as_ref().map(|p| p.len()))
+                    .unwrap_or(inner_len);
+                (
+                    content_len,
+                    content_type_byte(record.typ),
+                    record.typ == ContentType::ApplicationData,
+                )
             } else {
-                inner_len
+                (inner_len, APPLICATION_DATA, true)
             };
             Self {
                 explicit_nonce: record.explicit_nonce.clone(),
                 seq: record.seq,
                 inner_len,
                 content_len,
+                inner_type,
+                is_app_data,
             }
         })
     }
@@ -687,12 +737,20 @@ fn aes_ctr_apply_keystream_tls13(key: &[u8; 16], iv: &[u8; 12], seq: u64, input:
 /// Software consistency check used by the revealed-key (full-reveal) path.
 ///
 /// `plaintext` is the application content (transcript coordinates,
-/// `content_len` per record); `ciphertext` is the wire ciphertext
-/// (record-ciphertext coordinates, `inner_len` per record). For TLS 1.3 the
-/// inner plaintext is reconstructed as `content || 0x17 || 0x00*padding` before
-/// applying the keystream, so a wrong content boundary, inner type, or padding
-/// all surface as an `InvalidPlaintext` mismatch against the authenticated wire
-/// ciphertext.
+/// `content_len` per application-data record); `ciphertext` is the wire
+/// ciphertext (record-ciphertext coordinates, `inner_len` per record).
+///
+/// * TLS 1.2: each record's revealed content is re-encrypted and compared to
+///   the wire ciphertext.
+/// * TLS 1.3: the key is revealed, so the wire ciphertext is decrypted and the
+///   `type || padding` suffix is checked against the record's declared
+///   `inner_type` for **every** app-epoch record (locked classification, parent
+///   spec §5). For application-data records the decrypted content must also
+///   match the revealed transcript content; non-app-data records (NST /
+///   KeyUpdate / alert) keep their content blind and only have their suffix
+///   verified. A wrong content boundary, inner type, or non-zero padding all
+///   surface as an `InvalidPlaintext` mismatch against the authenticated wire
+///   ciphertext.
 fn verify_plaintext_with_key(
     cipher: &SoftCipher,
     records: &[RecordParams],
@@ -703,27 +761,50 @@ fn verify_plaintext_with_key(
     let mut c_pos = 0;
     let mut text = Vec::new();
     for record in records {
-        text.clear();
-        text.extend_from_slice(&plaintext[t_pos..t_pos + record.content_len]);
-
         match cipher {
             SoftCipher::V1_2 { key, iv } => {
                 debug_assert_eq!(record.content_len, record.inner_len);
+                text.clear();
+                text.extend_from_slice(&plaintext[t_pos..t_pos + record.content_len]);
                 aes_ctr_apply_keystream(key, iv, &record.explicit_nonce, &mut text);
+
+                if text != ciphertext[c_pos..c_pos + record.inner_len] {
+                    return Err(PlaintextAuthError(ErrorRepr::InvalidPlaintext));
+                }
+                t_pos += record.content_len;
             }
             SoftCipher::V1_3 { key, iv } => {
-                // Reconstruct the inner plaintext: content || type || padding.
-                text.push(APPLICATION_DATA);
-                text.resize(record.inner_len, 0u8);
-                aes_ctr_apply_keystream_tls13(key, iv, record.seq, &mut text);
+                // Recover the inner plaintext (`content || type || padding`) by
+                // decrypting the wire ciphertext with the revealed key.
+                let mut inner = ciphertext[c_pos..c_pos + record.inner_len].to_vec();
+                aes_ctr_apply_keystream_tls13(key, iv, record.seq, &mut inner);
+
+                // Validate the `type || padding` suffix against the declared
+                // inner type (pins the inner type and the content boundary).
+                if record.inner_len > record.content_len {
+                    if inner[record.content_len] != record.inner_type {
+                        return Err(PlaintextAuthError(ErrorRepr::InvalidPlaintext));
+                    }
+                    if inner[record.content_len + 1..record.inner_len]
+                        .iter()
+                        .any(|&b| b != 0)
+                    {
+                        return Err(PlaintextAuthError(ErrorRepr::InvalidPlaintext));
+                    }
+                }
+
+                // Application-data content is part of the transcript and must
+                // match what the prover revealed; non-app-data content stays
+                // blind.
+                if record.is_app_data {
+                    if inner[..record.content_len] != plaintext[t_pos..t_pos + record.content_len] {
+                        return Err(PlaintextAuthError(ErrorRepr::InvalidPlaintext));
+                    }
+                    t_pos += record.content_len;
+                }
             }
         }
 
-        if text != ciphertext[c_pos..c_pos + record.inner_len] {
-            return Err(PlaintextAuthError(ErrorRepr::InvalidPlaintext));
-        }
-
-        t_pos += record.content_len;
         c_pos += record.inner_len;
     }
 
@@ -891,6 +972,8 @@ mod tests {
                     seq: 0,
                     inner_len: len,
                     content_len: len,
+                    inner_type: APPLICATION_DATA,
+                    is_app_data: true,
                 }
             })
             .collect::<Vec<_>>();
@@ -962,6 +1045,8 @@ mod tests {
                     seq: seq as u64,
                     inner_len,
                     content_len,
+                    inner_type: APPLICATION_DATA,
+                    is_app_data: true,
                 }
             })
             .collect::<Vec<_>>();
@@ -1022,6 +1107,8 @@ mod tests {
                     seq: 0,
                     inner_len: len,
                     content_len: len,
+                    inner_type: APPLICATION_DATA,
+                    is_app_data: true,
                 }
             })
             .collect::<Vec<_>>();
@@ -1094,6 +1181,8 @@ mod tests {
                 seq: seq as u64,
                 inner_len: content_len + 1 + padding,
                 content_len,
+                inner_type: APPLICATION_DATA,
+                is_app_data: true,
             })
             .collect::<Vec<_>>();
 
@@ -1148,6 +1237,77 @@ mod tests {
         }
     }
 
+    /// Locked classification (parent spec §5): the suffix is proven for *every*
+    /// app-epoch record. A NewSessionTicket (inner type `0x16`, `is_app_data =
+    /// false`) carries no transcript content, yet its `type || padding` suffix
+    /// is verified against the declared inner type — so an honest declaration
+    /// passes while a mis-declared type or content boundary is rejected.
+    #[test]
+    fn test_verify_plaintext_with_key_tls13_nst() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut key = [0u8; 16];
+        let mut iv = [0u8; 12];
+        rng.fill(&mut key);
+        rng.fill(&mut iv);
+
+        // Record 0: application_data (content 32 + pad 3); record 1: a
+        // NewSessionTicket (content 20 + pad 2), excluded from the transcript.
+        let mk = |seq, content_len, pad, inner_type, is_app_data| RecordParams {
+            explicit_nonce: Vec::new(),
+            seq,
+            inner_len: content_len + 1 + pad,
+            content_len,
+            inner_type,
+            is_app_data,
+        };
+        let records = vec![
+            mk(0, 32, 3, APPLICATION_DATA, true),
+            mk(1, 20, 2, 0x16, false),
+        ];
+
+        // The application transcript holds only the app-data record's content.
+        let mut plaintext = vec![0u8; 32];
+        rng.fill(plaintext.as_mut_slice());
+        // The NST's "content" never enters the transcript.
+        let nst_content: Vec<u8> = (0..20u8).collect();
+
+        // Builds the wire ciphertext with a chosen NST inner type / boundary.
+        let build_ct = |nst_type: u8, nst_boundary: usize| -> Vec<u8> {
+            let mut ct = Vec::new();
+
+            let mut inner0 = plaintext.clone();
+            inner0.push(APPLICATION_DATA);
+            inner0.resize(records[0].inner_len, 0u8);
+            aes_ctr_apply_keystream_tls13(&key, &iv, 0, &mut inner0);
+            ct.extend_from_slice(&inner0);
+
+            let mut inner1 = nst_content[..nst_boundary].to_vec();
+            inner1.push(nst_type);
+            inner1.resize(records[1].inner_len, 0u8);
+            aes_ctr_apply_keystream_tls13(&key, &iv, 1, &mut inner1);
+            ct.extend_from_slice(&inner1);
+
+            ct
+        };
+
+        let cipher = SoftCipher::V1_3 { key, iv };
+
+        // Honest: NST inner type 0x16 at the declared boundary -> accepted.
+        let ct = build_ct(0x16, 20);
+        verify_plaintext_with_key(&cipher, &records, &plaintext, &ct).unwrap();
+
+        // Mis-declared type: the record carries 0x17 but is declared 0x16.
+        let ct_bad_type = build_ct(0x17, 20);
+        assert!(verify_plaintext_with_key(&cipher, &records, &plaintext, &ct_bad_type).is_err());
+
+        // Mis-declared boundary: the type byte sits one position early, so the
+        // declared suffix position holds zero padding (0x00 != 0x16).
+        let ct_bad_boundary = build_ct(0x16, 19);
+        assert!(
+            verify_plaintext_with_key(&cipher, &records, &plaintext, &ct_bad_boundary).is_err()
+        );
+    }
+
     /// The transcript -> record-ciphertext coordinate translation: content
     /// references shift by the running `inner_len - content_len` gap and never
     /// cross into a suffix, suffix references occupy `[content_len, inner_len)`
@@ -1164,6 +1324,8 @@ mod tests {
                 seq: seq as u64,
                 inner_len: content_len + 1 + padding,
                 content_len,
+                inner_type: APPLICATION_DATA,
+                is_app_data: true,
             })
             .collect::<Vec<_>>();
 

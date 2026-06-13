@@ -500,6 +500,7 @@ impl RecordLayer {
                 explicit_nonce: op.explicit_nonce,
                 ciphertext,
                 tag,
+                content_len: None,
             });
         }
 
@@ -518,6 +519,7 @@ impl RecordLayer {
                 explicit_nonce: op.explicit_nonce,
                 ciphertext: op.ciphertext,
                 tag: Some(op.tag),
+                content_len: None,
             });
         }
 
@@ -591,6 +593,7 @@ impl RecordLayer {
                 explicit_nonce: op.explicit_nonce,
                 ciphertext: op.ciphertext,
                 tag: Some(op.tag),
+                content_len: None,
             });
         }
 

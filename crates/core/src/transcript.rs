@@ -42,8 +42,8 @@ pub use proof::{
     TranscriptProof, TranscriptProofBuilder, TranscriptProofBuilderError, TranscriptProofError,
 };
 pub use tls::{
-    ContentType, Record, TlsTranscript, TlsTranscriptBuilder, TlsTranscriptError,
-    peek_tls_version_and_sh_hash,
+    ContentType, Record, Tls13Metadata, Tls13RecordMeta, TlsTranscript, TlsTranscriptBuilder,
+    TlsTranscriptError, peek_tls_version_and_sh_hash,
 };
 
 /// A transcript contains the plaintext of all application data communicated

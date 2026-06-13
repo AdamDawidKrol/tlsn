@@ -5,7 +5,7 @@ use rangeset::set::RangeSet;
 use tlsn_core::{
     VerifierOutput,
     config::prove::ProveRequest,
-    connection::{CertBinding, HandshakeData, ServerEphemKey, ServerName},
+    connection::{CertBinding, HandshakeData, ServerEphemKey, ServerName, TlsVersion},
     transcript::{
         ContentType, Direction, PartialTranscript, Record, TlsTranscript, TranscriptCommitment,
     },
@@ -29,17 +29,23 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
     handshake: Option<(ServerName, HandshakeData)>,
     transcript: Option<PartialTranscript>,
 ) -> Result<VerifierOutput> {
+    // TLS 1.3 proves the inner-type suffix of *every* app-epoch record (locked
+    // classification, parent metadata-channel spec §5); TLS 1.2 considers only
+    // the application-data records (the Finished record is excluded).
+    let is_v1_3 = tls_transcript.version() == TlsVersion::V1_3;
+
     // Full wire ciphertext (record-ciphertext coordinates) for the consistency
     // proof: TLS 1.2 has `inner_len == content_len`, so this also equals the
     // application-content length. For TLS 1.3 it is larger (it includes each
-    // record's inner `type || padding` suffix); the transcript-length check
-    // below must therefore compare against the content length, not this.
-    let ciphertext_sent = collect_ciphertext(tls_transcript.sent());
-    let ciphertext_recv = collect_ciphertext(tls_transcript.recv());
+    // record's inner `type || padding` suffix, and the NST/KeyUpdate/alert
+    // records); the transcript-length check below must therefore compare
+    // against the content length, not this.
+    let ciphertext_sent = collect_ciphertext(tls_transcript.sent(), is_v1_3);
+    let ciphertext_recv = collect_ciphertext(tls_transcript.recv(), is_v1_3);
 
     // §2.6: application-content length per direction.
-    let content_len_sent = content_len(tls_transcript.sent());
-    let content_len_recv = content_len(tls_transcript.recv());
+    let content_len_sent = content_len(tls_transcript.sent(), is_v1_3);
+    let content_len_recv = content_len(tls_transcript.recv(), is_v1_3);
 
     let transcript = if let Some((auth_sent, auth_recv)) = request.reveal() {
         let Some(transcript) = transcript else {
@@ -118,10 +124,7 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
         keys.sent_cipher_params(),
         transcript.sent_unsafe(),
         &ciphertext_sent,
-        tls_transcript
-            .sent()
-            .iter()
-            .filter(|record| record.typ == ContentType::ApplicationData),
+        proof_records(tls_transcript.sent(), is_v1_3),
         transcript.sent_authed(),
         &commit_sent,
     )
@@ -135,10 +138,7 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
         keys.recv_cipher_params(),
         transcript.received_unsafe(),
         &ciphertext_recv,
-        tls_transcript
-            .recv()
-            .iter()
-            .filter(|record| record.typ == ContentType::ApplicationData),
+        proof_records(tls_transcript.recv(), is_v1_3),
         transcript.received_authed(),
         &commit_recv,
     )
@@ -201,35 +201,52 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
     })
 }
 
-fn collect_ciphertext<'a>(records: impl IntoIterator<Item = &'a Record>) -> Vec<u8> {
-    let mut ciphertext = Vec::new();
+/// The records fed to the plaintext proof for one direction.
+///
+/// * TLS 1.3: **every** app-epoch record (its inner type is proven via the
+///   suffix, parent spec §5).
+/// * TLS 1.2: only the application-data records — this filters out the leading
+///   Finished record, preserving the original behaviour byte-for-byte.
+fn proof_records(records: &[Record], is_v1_3: bool) -> impl Iterator<Item = &Record> {
     records
-        .into_iter()
-        .filter(|record| record.typ == ContentType::ApplicationData)
-        .for_each(|record| {
-            ciphertext.extend_from_slice(&record.ciphertext);
-        });
+        .iter()
+        .filter(move |record| is_v1_3 || record.typ == ContentType::ApplicationData)
+}
+
+/// The concatenated wire ciphertext (record-ciphertext coordinates) fed to the
+/// consistency proof. Must match the record set of [`proof_records`]: every
+/// app-epoch record for TLS 1.3, only application-data records for TLS 1.2.
+fn collect_ciphertext(records: &[Record], is_v1_3: bool) -> Vec<u8> {
+    let mut ciphertext = Vec::new();
+    proof_records(records, is_v1_3).for_each(|record| {
+        ciphertext.extend_from_slice(&record.ciphertext);
+    });
     ciphertext
 }
 
-/// Sum of application-content lengths across app-data records (§2.6).
+/// Sum of application-content lengths across application-data records (§2.6).
 ///
-/// The application transcript counts only inner **content** bytes, so the
-/// transcript-length check compares against this rather than the raw wire
-/// ciphertext length ([`collect_ciphertext`]).
+/// The application transcript counts only inner **content** bytes of
+/// application-data records, so the transcript-length check compares against
+/// this rather than the raw wire ciphertext length ([`collect_ciphertext`]).
 ///
 /// * TLS 1.2: there is no inner `type || padding`, so `content_len ==
 ///   ciphertext.len()` per record and this equals the wire ciphertext length.
-/// * TLS 1.3 (TODO item 9): `content_len = inner_len - 1 - padding`, learned
-///   from the per-record `type || padding` suffix proof in
-///   `transcript_internal::auth` (§2.4). The verifier needs the prover-declared
-///   per-record content length to compute this; that metadata channel is the
-///   item-9 fixture work (open-question §5). Until then this returns the wire
-///   length, which is exact for TLS 1.2 and an over-estimate for TLS 1.3.
-fn content_len<'a>(records: impl IntoIterator<Item = &'a Record>) -> usize {
+/// * TLS 1.3: `content_len = inner_len - 1 - padding`, taken from the framed
+///   [`Record::content_len`] (set from the prover-declared metadata and
+///   validated by the per-record `type || padding` suffix proof in
+///   `transcript_internal::auth`, parent spec §3/§5). Non-application-data
+///   records (NST / KeyUpdate / alert) are excluded from the transcript.
+fn content_len(records: &[Record], is_v1_3: bool) -> usize {
     records
-        .into_iter()
+        .iter()
         .filter(|record| record.typ == ContentType::ApplicationData)
-        .map(|record| record.ciphertext.len())
+        .map(|record| {
+            if is_v1_3 {
+                record.content_len.unwrap_or(record.ciphertext.len())
+            } else {
+                record.ciphertext.len()
+            }
+        })
         .sum()
 }

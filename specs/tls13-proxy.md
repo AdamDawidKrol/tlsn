@@ -471,11 +471,11 @@ version dispatch calling the V1_3 `HandshakeData::verify` path (§6.3).
 | 6 | `verify_tags` 1.3 branch | `tlsn` | §7.2; DONE (spec `specs/tasks/tls13-verify-tags.md`; `src/tag.rs` `TagKeyIv` enum, 4 new tests). See integration notes below. |
 | 7 | Plaintext-proof suffix handling + range math | `tlsn` (`transcript_internal`) | §7.3; DONE (spec `specs/tasks/tls13-plaintext-proofs.md`; `CipherParams` enum + suffix/range math, 24 new tests). See integration notes below. |
 | 8 | Prover/verifier finalize flows, config plumbing | `tlsn` | §8; spec `specs/tasks/tls13-finalize-flows.md`; **DONE (wiring)**: `ProxyKeys` versioned key handle (`TlsOutput.keys`); dual-graph allocation (`Prf` + `KeySchedule13`) in `alloc_proxy_refs`; reordered 1.3 finalize (schedule phase-1 discloses `c_hs`/`s_hs` → build transcript → phase-2 from `h3`) on both prover & verifier; `tlsn-core` accessors `peek_tls_version_and_sh_hash` + `TlsTranscript::tls13_{sh,sf}_hash`; version-dispatched `verify_tags` / `prove`/`verify` / `HandshakeData::verify` / cf-sf checks. New hermetic unit tests; 1.2 e2e (`test_proxy`) unchanged. **Deferred to item 9**: flipping the client version list to offer 1.3 (the shared fixture auto-negotiates 1.3) and the prover→verifier per-record content-length / inner-plaintext channel — both need the 1.3-enabled fixture. |
-| 8b | TLS 1.3 record metadata channel + prover inner-plaintext recovery | `tlsn`, `tlsn-core` | §6.1/§7.3/open-q §5; spec `specs/tasks/tls13-record-metadata-channel.md`; depends on item 8 (DONE) — **unblocked**. Prover decrypts app records to recover inner plaintexts; prover→verifier per-record `(inner_type, content_len)` channel; verifier record (re)framing + NST classification; generalize item 7's `alloc_suffix` to the declared inner type. The functional gap before live 1.3 works. |
+| 8b | TLS 1.3 record metadata channel + prover inner-plaintext recovery | `tlsn`, `tlsn-core` | §6.1/§7.3/open-q §5; spec `specs/tasks/tls13-record-metadata-channel.md`; depends on item 8 (DONE). **DONE**: `CapturedSecrets::V1_3` extended with the `CLIENT/SERVER_TRAFFIC_SECRET_0` app secrets; the builder decrypts the app-epoch records (`tls13_app_secrets`) to recover each inner plaintext and frame `Record.{typ,plaintext,content_len}` (new `Record.content_len`); the prover→verifier per-record `Tls13Metadata{sent,recv}` of `Tls13RecordMeta{typ,content_len}` is sent at finalize time over the shared proxy IO channel (`ctx.io_mut()`, between key-schedule phase 1 and phase 2) and the verifier reframes from it (`tls13_record_meta`); item 7's `alloc_suffix` generalized to the declared inner type with `RecordParams.{inner_type,is_app_data}`; locked §5 classification — `prove`/`verify` run the `type \|\| padding` suffix proof over **every** app-epoch record (`verify.rs`/`prove.rs` no longer filter to `ApplicationData` for 1.3), NSTs/KeyUpdates/alerts keep their content blind but are still suffix-proven, and `content_len()` now uses the validated per-record lengths. New hermetic unit tests (prover recovery incl. NST + padded record, `Tls13Metadata` round-trip + verifier framing match, generalized `0x16` suffix pass/fail, content_len wiring, NST excluded from the app transcript); 1.2 paths byte-for-byte (`test_proxy` unchanged). **Gated on item 9**: live 1.3 e2e exercising the channel end-to-end (needs the 1.3-enabled fixture + version flip). |
 | 9 | Fixtures + tests + bench + version flip | `tls-server-fixture`, `harness`, `core` fixtures, `tlsn` | §9.1; owns the full webpki cert-chain happy path + live 1.3 capture deferred from item 5; **also owns** flipping the client version list to `&[&TLS13,&TLS12]` (item 8 left it 1.2-only so the shared fixture keeps negotiating 1.2), the live prover↔verifier 1.3 e2e + negotiation matrix, and the dual-allocation cost bench (open-question §2). Depends on item 8b. |
 
 Suggested order: 1 (DONE) → 2+4 (DONE) → 5 ∥ 3 (DONE) → 6 ∥ 7 (DONE) →
-8 (DONE) → **8b** (unblocked now) → 9.
+8 (DONE) → 8b (DONE) → **9** (unblocked now).
 
 ### Commit hygiene (rule)
 
@@ -558,11 +558,16 @@ the branch reviewable and bisectable, with each commit building on its own.
   item 8 constructs it.
 - **Item 7 — plaintext proofs (`tlsn`)**: `prove_plaintext` / `verify_plaintext`
   take `cipher: CipherParams` (`V1_2 { iv:[u8;4] }` / `V1_3 { iv:[u8;12] }`).
-  `RecordParams` gained `seq`/`inner_len`/`content_len`; the 1.3 `content_len`
-  still falls back to `inner_len` until item 8 threads real per-record content
-  lengths (prover: `record.plaintext.len()`; verifier: prover-declared, validated
-  by the suffix proof). The verifier length check now routes through a
-  `content_len()` helper in `verifier/verify.rs`.
+  `RecordParams` gained `seq`/`inner_len`/`content_len`; **item 8b** added
+  `inner_type`/`is_app_data` and threads the real per-record content lengths via
+  `RecordParams::from_records` (prover: the decrypted `record.plaintext`/the
+  framed `Record.content_len`; verifier: the prover-declared `Record.content_len`,
+  validated by the suffix proof). `alloc_suffix` now assigns the declared inner
+  type, and the suffix proof runs over **every** app-epoch record (locked §5
+  classification) — non-app-data records (`is_app_data == false`) contribute no
+  transcript content. The verifier length check routes through the
+  `content_len()` helper in `verifier/verify.rs`, now using the validated
+  per-record lengths instead of the wire over-estimate.
 
 ### 9.1 Test plan
 

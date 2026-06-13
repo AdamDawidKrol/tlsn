@@ -115,6 +115,7 @@ impl TranscriptGenerator {
             explicit_nonce: explicit_nonce.to_vec(),
             ciphertext,
             tag: Some(tag),
+            content_len: None,
         }
     }
 
@@ -150,6 +151,7 @@ impl TranscriptGenerator {
             explicit_nonce: explicit_nonce.to_vec(),
             ciphertext,
             tag: Some(tag),
+            content_len: None,
         }
     }
 }

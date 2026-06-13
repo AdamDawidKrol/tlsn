@@ -10,7 +10,10 @@
 //! hence SHA-256 (32-byte secrets), 16-byte keys and 12-byte IVs throughout.
 
 use aead::Payload as AeadPayload;
-use aes_gcm::{Aes128Gcm, NewAead, aead::Aead, aead::generic_array::GenericArray};
+use aes_gcm::{
+    Aes128Gcm, NewAead,
+    aead::{Aead, generic_array::GenericArray},
+};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 use tls_core::cipher::make_tls13_aad;
@@ -90,21 +93,25 @@ pub(crate) fn verify_data(
     mac.finalize().into_bytes().into()
 }
 
-/// Decrypts one TLS 1.3 record body into the inner plaintext, returning
-/// `(inner_content_type, content_bytes)`.
+/// Decrypts one TLS 1.3 record body into its **full inner plaintext**
+/// `content || inner_type || padding` (length `== record_body.len() -
+/// TAG_LEN`, i.e. the inner ciphertext length).
 ///
 /// `record_body` is the on-the-wire record payload, i.e. `ciphertext ||
 /// 16-byte tag` (no 5-byte record header). The nonce is
-/// `iv XOR (0^4 || seq_be64)`, the AAD is [`make_tls13_aad`] over the full
-/// body length (tag included), and the inner content type is the last
-/// non-zero byte of the decrypted plaintext (zero padding follows it,
-/// RFC 8446 §5.2). A tag mismatch is a hard error (parent §6.5).
-pub(crate) fn decrypt_record(
+/// `iv XOR (0^4 || seq_be64)` and the AAD is [`make_tls13_aad`] over the full
+/// body length (tag included). A tag mismatch is a hard error (parent §6.5).
+///
+/// This is the building block used to recover the inner-plaintext stream the
+/// builder needs to frame the application-epoch records (parent spec §1.2): no
+/// padding is stripped, so a record can be re-split by its inner-ciphertext
+/// length. [`decrypt_record`] is the type/content-only convenience wrapper.
+pub(crate) fn decrypt_record_inner(
     key: &[u8; KEY_LEN],
     iv: &[u8; IV_LEN],
     seq: u64,
     record_body: &[u8],
-) -> Result<(u8, Vec<u8>), TlsTranscriptError> {
+) -> Result<Vec<u8>, TlsTranscriptError> {
     if record_body.len() < TAG_LEN {
         return Err(TlsTranscriptError::crypto(
             "TLS 1.3 encrypted record shorter than the AEAD tag",
@@ -121,7 +128,7 @@ pub(crate) fn decrypt_record(
     let aad = make_tls13_aad(record_body.len());
 
     let cipher = Aes128Gcm::new_from_slice(key).expect("key is 16 bytes");
-    let mut plaintext = cipher
+    cipher
         .decrypt(
             GenericArray::from_slice(&nonce),
             AeadPayload {
@@ -129,7 +136,21 @@ pub(crate) fn decrypt_record(
                 aad: &aad,
             },
         )
-        .map_err(|_| TlsTranscriptError::crypto("TLS 1.3 record AEAD tag verification failed"))?;
+        .map_err(|_| TlsTranscriptError::crypto("TLS 1.3 record AEAD tag verification failed"))
+}
+
+/// Decrypts one TLS 1.3 record body into its inner plaintext, returning
+/// `(inner_content_type, content_bytes)` (padding stripped).
+///
+/// The inner content type is the last non-zero byte of the decrypted plaintext
+/// (zero padding follows it, RFC 8446 §5.2).
+pub(crate) fn decrypt_record(
+    key: &[u8; KEY_LEN],
+    iv: &[u8; IV_LEN],
+    seq: u64,
+    record_body: &[u8],
+) -> Result<(u8, Vec<u8>), TlsTranscriptError> {
+    let mut plaintext = decrypt_record_inner(key, iv, seq, record_body)?;
 
     // Strip trailing zero padding; the last non-zero byte is the inner type.
     let type_pos = plaintext
@@ -140,6 +161,33 @@ pub(crate) fn decrypt_record(
     plaintext.truncate(type_pos);
 
     Ok((inner_type, plaintext))
+}
+
+/// Seals a TLS 1.3 record: encrypts the full inner plaintext
+/// (`content || type || padding`) and returns the on-the-wire record body
+/// `ciphertext || tag` (the inverse of [`decrypt_record_inner`]). Test-only.
+#[cfg(test)]
+pub(crate) fn seal_record_inner(
+    key: &[u8; KEY_LEN],
+    iv: &[u8; IV_LEN],
+    seq: u64,
+    inner: &[u8],
+) -> Vec<u8> {
+    let mut nonce = *iv;
+    for (n, s) in nonce[IV_LEN - 8..].iter_mut().zip(seq.to_be_bytes()) {
+        *n ^= s;
+    }
+    let aad = make_tls13_aad(inner.len() + TAG_LEN);
+    let cipher = Aes128Gcm::new_from_slice(key).expect("key is 16 bytes");
+    cipher
+        .encrypt(
+            GenericArray::from_slice(&nonce),
+            AeadPayload {
+                msg: inner,
+                aad: &aad,
+            },
+        )
+        .expect("seal succeeds")
 }
 
 /// RFC 8448 §3 "Simple 1-RTT Handshake" vectors, shared by the crypto
@@ -305,8 +353,7 @@ pub(crate) mod rfc8448 {
 
 #[cfg(test)]
 mod tests {
-    use super::rfc8448::*;
-    use super::*;
+    use super::{rfc8448::*, *};
 
     #[test]
     fn hkdf_expand_label_matches_rfc8448() {
@@ -398,5 +445,45 @@ mod tests {
         let (c_key, c_iv) = traffic_keys(&hex_arr::<32>(C_HS));
         let record_body = hex(SERVER_FLIGHT_RECORD);
         assert!(decrypt_record(&c_key, &c_iv, 0, &record_body).is_err());
+    }
+
+    /// Seal then recover the full inner plaintext (with trailing zero padding)
+    /// for a padded application-data record and a padded NewSessionTicket,
+    /// across several sequence numbers. `decrypt_record_inner` keeps the
+    /// padding (so the record can be re-split by inner length);
+    /// `decrypt_record` strips it and reports the inner type (parent
+    /// metadata-channel spec §1).
+    #[test]
+    fn decrypt_record_inner_roundtrip_with_padding() {
+        let (key, iv) = traffic_keys(&hex_arr::<32>(C_AP));
+
+        // (inner content type, content length, padding length).
+        let cases = [
+            (0x17u8, 50usize, 0usize), // application_data, no padding
+            (0x17, 32, 7),             // application_data, padded
+            (0x16, 20, 3),             // NewSessionTicket, padded
+            (0x15, 1, 5),              // alert, padded
+            (0x17, 0, 4),              // empty content, padded
+        ];
+
+        for (seq, &(typ, content_len, pad)) in cases.iter().enumerate() {
+            let content: Vec<u8> = (0..content_len).map(|i| i as u8).collect();
+            let mut inner = content.clone();
+            inner.push(typ);
+            inner.resize(content_len + 1 + pad, 0u8);
+
+            let body = seal_record_inner(&key, &iv, seq as u64, &inner);
+            // `ciphertext.len() == inner.len()`, plus the 16-byte tag.
+            assert_eq!(body.len(), inner.len() + TAG_LEN);
+
+            // Full inner plaintext is recovered, padding included.
+            let recovered = decrypt_record_inner(&key, &iv, seq as u64, &body).unwrap();
+            assert_eq!(recovered, inner);
+
+            // Type/content view strips the padding and reports the inner type.
+            let (rec_type, rec_content) = decrypt_record(&key, &iv, seq as u64, &body).unwrap();
+            assert_eq!(rec_type, typ);
+            assert_eq!(rec_content, content);
+        }
     }
 }

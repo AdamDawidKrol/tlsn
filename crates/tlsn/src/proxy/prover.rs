@@ -8,6 +8,7 @@ use hmac_sha256::{KeySchedule13, MSMode, NetworkMode, Prf, PrfConfig};
 use mpz_common::Context;
 use mpz_memory_core::MemoryExt;
 use mpz_vm_core::Execute;
+use serio::SinkExt;
 use tlsn_core::transcript::{TlsTranscript, peek_tls_version_and_sh_hash};
 
 #[derive(Debug)]
@@ -71,11 +72,15 @@ impl ProxyProver {
                 handshake_secret,
                 client_hs_traffic_secret,
                 server_hs_traffic_secret,
+                client_ap_traffic_secret,
+                server_ap_traffic_secret,
             } => {
                 self.finalize_v1_3(
                     handshake_secret,
                     client_hs_traffic_secret,
                     server_hs_traffic_secret,
+                    client_ap_traffic_secret,
+                    server_ap_traffic_secret,
                     time,
                     traffic,
                 )
@@ -207,11 +212,14 @@ impl ProxyProver {
     /// flight needs the disclosed `c_hs`/`s_hs`, which the schedule produces
     /// from `h2`. Then the built transcript's `h3` feeds the schedule's second
     /// phase to derive the application keys.
+    #[allow(clippy::too_many_arguments)]
     async fn finalize_v1_3(
         mut self,
         handshake_secret: [u8; 32],
         client_hs_traffic_secret: [u8; 32],
         server_hs_traffic_secret: [u8; 32],
+        client_ap_traffic_secret: [u8; 32],
+        server_ap_traffic_secret: [u8; 32],
         time: u64,
         traffic: TlsBytes,
     ) -> Result<(Context, ProverZk, TlsOutput), TlsnError> {
@@ -269,14 +277,18 @@ impl ProxyProver {
         }
 
         // 6. Build the transcript, decrypting the handshake flight with the
-        // disclosed secrets. This also computes `h2`/`h3`.
+        // disclosed secrets. This also computes `h2`/`h3`. The application
+        // traffic secrets let the builder decrypt the app-epoch records and
+        // recover each one's inner plaintext (`content || type || padding`),
+        // so `Record.typ`/`plaintext`/`content_len` are framed exactly
+        // (metadata-channel spec §1). These cleartext keys are the prover's own
+        // framing input; the ZK proof still uses the ZK-derived `refs.keys13`.
         let tls_transcript = TlsTranscript::builder()
             .time(time)
             .tls_sent(&traffic.tls_sent)
             .tls_recv(&traffic.tls_recv)
-            .app_sent(&traffic.app_sent)
-            .app_recv(&traffic.app_recv)
             .handshake_secrets(c_hs, s_hs)
+            .tls13_app_secrets(client_ap_traffic_secret, server_ap_traffic_secret)
             .build()
             .map_err(|e| {
                 TlsnError::internal()
@@ -284,6 +296,21 @@ impl ProxyProver {
                     .with_source(e)
             })?;
         tracing::debug!("successfully parsed tls 1.3 transcript");
+
+        // 6b. Metadata channel (metadata-channel spec §2), finalize-time mux
+        // seam: send the prover's per-record `(inner_type, content_len)`
+        // framing over the shared proxy IO channel so the verifier (which
+        // cannot decrypt) frames its transcript symmetrically. This is the
+        // *primary* seam — it is sent here, after phase 1 drained the channel
+        // and before phase 2, so the verifier has it before building its own
+        // transcript. The values are a hint the `type || padding` suffix proof
+        // validates, not trusted input (spec §5).
+        let metadata = tls_transcript.tls13_record_metadata();
+        self.ctx.io_mut().send(metadata).await.map_err(|e| {
+            TlsnError::internal()
+                .with_msg("prover could not send tls 1.3 record metadata")
+                .with_source(e)
+        })?;
 
         // 7. `h3 = H(CH..server Finished)` feeds the schedule's second phase.
         let h3 = tls_transcript

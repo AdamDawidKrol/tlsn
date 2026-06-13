@@ -6,6 +6,7 @@ use crate::{
     webpki::CertificateDer,
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 mod builder;
@@ -201,6 +202,29 @@ impl TlsTranscript {
         self.tls13_sf_hash
     }
 
+    /// Returns the prover→verifier per-record TLS 1.3 framing metadata for the
+    /// app-epoch records of both directions (parent spec §6.1, open-question
+    /// §5).
+    ///
+    /// **TLS 1.3 only.** The prover builds this from its decrypted records and
+    /// sends it to the verifier, which cannot decrypt; the verifier re-frames
+    /// its (plaintext-less) records from this metadata and *validates* it with
+    /// the `type || padding` suffix proof.
+    pub fn tls13_record_metadata(&self) -> Tls13Metadata {
+        fn meta(record: &Record) -> Tls13RecordMeta {
+            Tls13RecordMeta {
+                typ: inner_type_byte(record.typ),
+                // Falls back to the full inner length only if `content_len` was
+                // never set; for a built 1.3 transcript it is always present.
+                content_len: record.content_len.unwrap_or(record.ciphertext.len()) as u32,
+            }
+        }
+        Tls13Metadata {
+            sent: self.sent.iter().map(meta).collect(),
+            recv: self.recv.iter().map(meta).collect(),
+        }
+    }
+
     /// Returns the application data transcript.
     pub fn to_transcript(&self) -> Result<Transcript, TlsTranscriptError> {
         let mut sent = Vec::new();
@@ -257,9 +281,48 @@ pub struct Record {
     pub ciphertext: Vec<u8>,
     /// Tag.
     pub tag: Option<Vec<u8>>,
+    /// Application-content length, i.e. the number of leading
+    /// [`ciphertext`](Self::ciphertext) bytes that are application content.
+    ///
+    /// `None` for TLS 1.2 (the whole record body is content; framing falls
+    /// back to [`plaintext`](Self::plaintext)/`ciphertext.len()`). For TLS 1.3
+    /// it is `inner_len - 1 - padding`, set by the prover from the decrypted
+    /// content (`plaintext.len()`) and by the verifier from the prover-declared
+    /// [`Tls13RecordMeta`] (validated by the `type || padding` suffix proof).
+    pub content_len: Option<usize>,
 }
 
 opaque_debug::implement!(Record);
+
+/// Per-record TLS 1.3 framing metadata declared by the prover to the verifier
+/// (parent spec §6.1, open-question §5).
+///
+/// In TLS 1.3 every application-epoch record is wire-typed `application_data`;
+/// the real inner type is the last non-zero byte of the decrypted inner
+/// plaintext and the content length is hidden by padding. The verifier cannot
+/// decrypt (its application keys are blind in ZK), so the prover declares this
+/// per record. It is a *hint*: the `type || padding` suffix proof
+/// (`transcript_internal::auth`) validates it against the wire ciphertext, so a
+/// mis-declared type or content boundary fails the consistency proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tls13RecordMeta {
+    /// Inner content type (RFC 8446 §5.1): `0x17` application_data, `0x16`
+    /// handshake (NewSessionTicket/KeyUpdate), `0x15` alert.
+    pub typ: u8,
+    /// Inner content length (`inner_len - 1 - padding`); the padding length is
+    /// derived by the verifier from the wire (`ciphertext.len()`), not sent.
+    pub content_len: u32,
+}
+
+/// The prover→verifier per-record TLS 1.3 framing metadata for both
+/// directions, in record order (see [`Tls13RecordMeta`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Tls13Metadata {
+    /// App-epoch records, sent direction, in order.
+    pub sent: Vec<Tls13RecordMeta>,
+    /// App-epoch records, recv direction, in order.
+    pub recv: Vec<Tls13RecordMeta>,
+}
 
 /// TLS record content type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -301,6 +364,19 @@ impl From<tls_core::msgs::enums::ContentType> for ContentType {
             tls_core::msgs::enums::ContentType::Heartbeat => ContentType::Heartbeat,
             tls_core::msgs::enums::ContentType::Unknown(id) => ContentType::Unknown(id),
         }
+    }
+}
+
+/// The TLS 1.3 inner content-type byte for a [`ContentType`] (RFC 8446 §5.1),
+/// the inverse of `builder::inner_content_type`.
+pub(crate) fn inner_type_byte(typ: ContentType) -> u8 {
+    match typ {
+        ContentType::ChangeCipherSpec => 0x14,
+        ContentType::Alert => 0x15,
+        ContentType::Handshake => 0x16,
+        ContentType::ApplicationData => 0x17,
+        ContentType::Heartbeat => 0x18,
+        ContentType::Unknown(id) => id,
     }
 }
 

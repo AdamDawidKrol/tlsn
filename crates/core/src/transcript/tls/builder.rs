@@ -23,8 +23,8 @@ use crate::{
 };
 
 use super::{
-    ContentType, Record, TlsTranscript, TlsTranscriptError,
-    tls13::{decrypt_record, finished_key, traffic_keys, verify_data},
+    ContentType, Record, Tls13Metadata, Tls13RecordMeta, TlsTranscript, TlsTranscriptError,
+    tls13::{decrypt_record, decrypt_record_inner, finished_key, traffic_keys, verify_data},
 };
 
 /// Builder for [`TlsTranscript`].
@@ -44,6 +44,18 @@ pub struct TlsTranscriptBuilder<'a> {
     /// Disclosed TLS 1.3 handshake traffic secrets `(c_hs, s_hs)`, used to
     /// decrypt the handshake flight. Ignored for TLS 1.2.
     handshake_secrets: Option<([u8; 32], [u8; 32])>,
+    /// TLS 1.3 application traffic secrets `(c_ap, s_ap)`. The **prover** path:
+    /// when present, the builder derives the application write keys and
+    /// decrypts the app-epoch records to recover their inner plaintexts
+    /// (`content || type || padding`), framing `Record.typ`/`plaintext`/
+    /// `content_len` exactly (parent spec §1). Ignored for TLS 1.2.
+    app_traffic_secrets: Option<([u8; 32], [u8; 32])>,
+    /// TLS 1.3 per-record framing metadata. The **verifier** path: it cannot
+    /// decrypt (its keys are blind in ZK), so the prover declares each
+    /// app-epoch record's `(inner_type, content_len)` and the builder frames
+    /// `Record.typ`/`content_len` from it (`plaintext` stays `None`). It is a
+    /// hint validated by the suffix proof (parent spec §3/§5). Ignored for 1.2.
+    tls13_record_meta: Option<Tls13Metadata>,
 }
 
 impl<'a> TlsTranscriptBuilder<'a> {
@@ -68,6 +80,25 @@ impl<'a> TlsTranscriptBuilder<'a> {
     /// the prover.
     pub fn handshake_secrets(mut self, c_hs: [u8; 32], s_hs: [u8; 32]) -> Self {
         self.handshake_secrets = Some((c_hs, s_hs));
+        self
+    }
+
+    /// Supplies the TLS 1.3 application traffic secrets `(c_ap, s_ap)` so the
+    /// builder can decrypt the application-epoch records and frame them from
+    /// their recovered inner plaintexts (the **prover** path, parent spec §1).
+    /// Ignored for TLS 1.2. Mutually exclusive with
+    /// [`tls13_record_meta`](Self::tls13_record_meta); if both are set the
+    /// application secrets take precedence.
+    pub fn tls13_app_secrets(mut self, c_ap: [u8; 32], s_ap: [u8; 32]) -> Self {
+        self.app_traffic_secrets = Some((c_ap, s_ap));
+        self
+    }
+
+    /// Supplies the prover-declared per-record TLS 1.3 framing metadata so the
+    /// builder can frame the application-epoch records without the application
+    /// keys (the **verifier** path, parent spec §3). Ignored for TLS 1.2.
+    pub fn tls13_record_meta(mut self, meta: Tls13Metadata) -> Self {
+        self.tls13_record_meta = Some(meta);
         self
     }
 
@@ -259,15 +290,44 @@ impl<'a> TlsTranscriptBuilder<'a> {
             tls13_sh_hash = Some(out.h2);
             tls13_sf_hash = Some(out.h3);
 
+            // Per-direction framing precedence (parent spec §1/§3):
+            //   1. application traffic secrets -> decrypt in the builder (the prover; the
+            //      single source of truth for inner framing);
+            //   2. prover-declared metadata -> frame without keys (the verifier);
+            //   3. a pre-decrypted inner-plaintext stream (`app_sent`/`app_recv`);
+            //   4. blind (tag-only; inner type/content unknown).
+            let (c_ap_keys, s_ap_keys) = match self.app_traffic_secrets {
+                Some((c_ap, s_ap)) => (Some(traffic_keys(&c_ap)), Some(traffic_keys(&s_ap))),
+                None => (None, None),
+            };
+            let sent_framing = if let Some((key, iv)) = c_ap_keys {
+                Tls13Framing::Decrypt { key, iv }
+            } else if let Some(meta) = &self.tls13_record_meta {
+                Tls13Framing::Meta(&meta.sent)
+            } else if let Some(app_sent) = self.app_sent {
+                Tls13Framing::Inner(app_sent)
+            } else {
+                Tls13Framing::Blind
+            };
+            let recv_framing = if let Some((key, iv)) = s_ap_keys {
+                Tls13Framing::Decrypt { key, iv }
+            } else if let Some(meta) = &self.tls13_record_meta {
+                Tls13Framing::Meta(&meta.recv)
+            } else if let Some(app_recv) = self.app_recv {
+                Tls13Framing::Inner(app_recv)
+            } else {
+                Tls13Framing::Blind
+            };
+
             let sent = if let Some(records_sent) = self.records_sent.take() {
                 records_sent
             } else {
-                parse_records_tls13(sent_raw, self.app_sent, out.sent_app_start)?
+                parse_records_tls13(sent_raw, sent_framing, out.sent_app_start)?
             };
             let recv = if let Some(records_recv) = self.records_recv.take() {
                 records_recv
             } else {
-                parse_records_tls13(recv_raw, self.app_recv, out.recv_app_start)?
+                parse_records_tls13(recv_raw, recv_framing, out.recv_app_start)?
             };
             (sent, recv)
         } else {
@@ -786,6 +846,7 @@ fn split_into_record(
         explicit_nonce: payload[..NONCE_LEN].to_vec(),
         ciphertext: payload[NONCE_LEN..payload.len() - TAG_LEN].to_vec(),
         tag: Some(payload[payload.len() - TAG_LEN..].to_vec()),
+        content_len: None,
     })
 }
 
@@ -1052,6 +1113,7 @@ fn parse_records(
         explicit_nonce: payload[..NONCE_LEN].to_vec(),
         ciphertext: payload[NONCE_LEN..payload.len() - TAG_LEN].to_vec(),
         tag: Some(payload[payload.len() - TAG_LEN..].to_vec()),
+        content_len: None,
     };
     parsed.push(finished_record);
 
@@ -1225,6 +1287,31 @@ fn inner_content_type(value: u8) -> ContentType {
     }
 }
 
+/// How the TLS 1.3 application-epoch records are framed (`typ`, `plaintext`,
+/// `content_len`) by [`parse_records_tls13`].
+enum Tls13Framing<'a> {
+    /// **Prover** path (parent spec §1): decrypt each record with the
+    /// application write key/iv to recover its full inner plaintext
+    /// (`content || type || padding`), then frame from it. This is the
+    /// recommended path — the builder is the single source of truth for the
+    /// inner-plaintext stream and the content boundary.
+    Decrypt { key: [u8; 16], iv: [u8; 12] },
+    /// **Prover** path (pre-decrypted): the concatenation of the per-record
+    /// inner plaintexts (`content || type || padding`), re-split per record by
+    /// the inner-ciphertext length (`ciphertext.len() ==
+    /// inner_plaintext.len()`).
+    Inner(&'a [u8]),
+    /// **Verifier** path (parent spec §3): the prover-declared per-record
+    /// `(inner_type, content_len)` metadata, one entry per app-epoch record in
+    /// order. `plaintext` stays `None` (the verifier cannot decrypt); the
+    /// declared values are a *hint* validated by the `type || padding` suffix
+    /// proof (parent spec §5/§7.3).
+    Meta(&'a [Tls13RecordMeta]),
+    /// No framing info: every record is provisionally typed `application_data`
+    /// with an unknown content boundary (`plaintext`/`content_len` = `None`).
+    Blind,
+}
+
 /// Frames the TLS 1.3 application-epoch records (parent spec §6.4).
 ///
 /// Records before `app_start` (the plaintext ClientHello/ServerHello, the
@@ -1234,25 +1321,33 @@ fn inner_content_type(value: u8) -> ContentType {
 /// `ciphertext.len() == inner_plaintext.len()`); the trailing 16 bytes are the
 /// tag.
 ///
-/// `app_data`, when present, is the concatenation of the per-record **inner**
-/// plaintexts (`content || inner_type || padding`), supplied by the party that
-/// holds the application keys. Because the inner ciphertext and inner plaintext
-/// have equal length, it is re-split per record; the inner type (the last
-/// non-zero byte) sets [`Record::typ`] and the preceding `content` sets
-/// [`Record::plaintext`]. When `app_data` is absent (the verifier, before the
-/// ZK record proofs) the inner type and content are unknown without the
-/// application keys: `plaintext` is `None` and `typ` is provisionally
-/// `ApplicationData`. The authoritative inner-type classification and the
-/// `type || padding` suffix proof are item 7 (parent spec §7.3).
+/// The inner [`Record::typ`], [`Record::plaintext`] and [`Record::content_len`]
+/// are derived from `framing` (see [`Tls13Framing`]). For the prover paths the
+/// inner type is the last non-zero byte of the inner plaintext, `content` is
+/// what precedes it, and `content_len = inner_len - 1 - padding`. For the
+/// verifier path they come from the prover-declared metadata (validated later
+/// by the suffix proof). With [`Tls13Framing::Blind`] the type defaults to
+/// `application_data` and the content boundary is left unknown.
 fn parse_records_tls13(
     records: &[OpaqueMessage],
-    app_data: Option<&[u8]>,
+    framing: Tls13Framing<'_>,
     app_start: usize,
 ) -> Result<Vec<Record>, TlsTranscriptError> {
+    let app_records: Vec<&OpaqueMessage> = records.iter().skip(app_start).collect();
+
+    // The verifier-supplied metadata must cover exactly the app-epoch records.
+    if let Tls13Framing::Meta(metas) = &framing
+        && metas.len() != app_records.len()
+    {
+        return Err(TlsTranscriptError::parse(
+            "TLS 1.3 record metadata count does not match the app-epoch records",
+        ));
+    }
+
     let mut parsed = Vec::new();
     let mut consumed = 0usize;
 
-    for (seq, record) in (0u64..).zip(records.iter().skip(app_start)) {
+    for (i, (seq, record)) in (0u64..).zip(app_records).enumerate() {
         let body = &record.payload.0;
         if body.len() < TAG_LEN {
             return Err(TlsTranscriptError::parse(
@@ -1263,25 +1358,47 @@ fn parse_records_tls13(
         let ciphertext = body[..ct_len].to_vec();
         let tag = body[ct_len..].to_vec();
 
-        let (typ, plaintext) = if let Some(app_data) = app_data {
-            // `ciphertext.len() == inner_plaintext.len()` lets us re-split the
-            // supplied inner plaintexts by the record's inner-ciphertext length.
-            let inner = app_data.get(consumed..consumed + ct_len).ok_or_else(|| {
-                TlsTranscriptError::parse("insufficient TLS 1.3 inner plaintext for app records")
-            })?;
-            consumed += ct_len;
-
+        // Frames one record from its recovered inner plaintext
+        // (`content || type || padding`): the inner type is the last non-zero
+        // byte, `content` is what precedes it.
+        let frame_from_inner = |inner: &[u8]| -> Result<_, TlsTranscriptError> {
             let type_pos = inner.iter().rposition(|&b| b != 0).ok_or_else(|| {
                 TlsTranscriptError::parse("TLS 1.3 inner plaintext is all zero padding")
             })?;
-            (
+            Ok((
                 inner_content_type(inner[type_pos]),
                 Some(inner[..type_pos].to_vec()),
-            )
-        } else {
-            // TODO(item 7, parent spec §7.3): the verifier learns the inner
-            // type and the `type || padding` suffix via the ZK record proofs.
-            (ContentType::ApplicationData, None)
+                Some(type_pos),
+            ))
+        };
+
+        let (typ, plaintext, content_len) = match &framing {
+            Tls13Framing::Decrypt { key, iv } => {
+                let inner = decrypt_record_inner(key, iv, seq, body)?;
+                frame_from_inner(&inner)?
+            }
+            Tls13Framing::Inner(app_data) => {
+                // `ciphertext.len() == inner_plaintext.len()` re-splits the
+                // supplied inner plaintexts by the inner-ciphertext length.
+                let inner = app_data.get(consumed..consumed + ct_len).ok_or_else(|| {
+                    TlsTranscriptError::parse(
+                        "insufficient TLS 1.3 inner plaintext for app records",
+                    )
+                })?;
+                consumed += ct_len;
+                frame_from_inner(inner)?
+            }
+            Tls13Framing::Meta(metas) => {
+                let m = metas[i];
+                let content_len = m.content_len as usize;
+                if content_len > ct_len.saturating_sub(1) {
+                    return Err(TlsTranscriptError::parse(
+                        "TLS 1.3 declared content length exceeds the record's inner plaintext",
+                    ));
+                }
+                (inner_content_type(m.typ), None, Some(content_len))
+            }
+            Tls13Framing::Blind => (ContentType::ApplicationData, None, None),
         };
 
         parsed.push(Record {
@@ -1291,6 +1408,7 @@ fn parse_records_tls13(
             explicit_nonce: Vec::new(),
             ciphertext,
             tag: Some(tag),
+            content_len,
         });
     }
 
@@ -1611,5 +1729,167 @@ mod tests {
             .build();
 
         assert!(err.is_err());
+    }
+
+    /// Prover inner-plaintext recovery (parent metadata-channel spec §1): given
+    /// the application traffic secrets, the builder decrypts the app-epoch
+    /// records and frames each one's `typ`/`plaintext`/`content_len` from its
+    /// recovered inner plaintext — an application-data record (sent) and a
+    /// NewSessionTicket (recv, excluded from the application transcript).
+    #[test]
+    fn test_tls13_prover_recovers_inner_plaintext() {
+        let w = rfc8448_wire();
+        let c_ap = rfc8448::hex_arr::<32>(rfc8448::C_AP);
+        let s_ap = rfc8448::hex_arr::<32>(rfc8448::S_AP);
+
+        let transcript = TlsTranscript::builder()
+            .time(0)
+            .tls_sent(&w.tls_sent)
+            .tls_recv(&w.tls_recv)
+            .handshake_secrets(w.c_hs, w.s_hs)
+            .tls13_app_secrets(c_ap, s_ap)
+            .build()
+            .unwrap();
+
+        // Sent: one application_data record, content `0x00..=0x31` (50 bytes),
+        // no padding -> content_len == inner ciphertext length minus the type.
+        assert_eq!(transcript.sent().len(), 1);
+        let sent0 = &transcript.sent()[0];
+        assert_eq!(sent0.typ, ContentType::ApplicationData);
+        let expected_sent: Vec<u8> = (0u8..=0x31).collect();
+        assert_eq!(sent0.content_len, Some(expected_sent.len()));
+        assert_eq!(sent0.plaintext.as_deref(), Some(expected_sent.as_slice()));
+        assert_eq!(sent0.content_len, Some(sent0.ciphertext.len() - 1));
+
+        // Recv: the NewSessionTicket, classified as handshake (inner 0x16) and
+        // recovered, but excluded from the application transcript.
+        assert_eq!(transcript.recv().len(), 1);
+        let recv0 = &transcript.recv()[0];
+        assert_eq!(recv0.typ, ContentType::Handshake);
+        assert!(recv0.content_len.is_some());
+        assert!(recv0.plaintext.is_some());
+
+        let app = transcript.to_transcript().unwrap();
+        assert_eq!(app.sent(), expected_sent.as_slice());
+        assert!(app.received().is_empty());
+    }
+
+    /// Metadata channel round-trip + verifier framing (parent spec §2/§3): the
+    /// prover exports the per-record metadata, it round-trips through the wire
+    /// codec, and the verifier (with no application keys) frames its transcript
+    /// to the *same* `typ`/`content_len` as the prover — holding no plaintext.
+    #[test]
+    fn test_tls13_verifier_frames_from_metadata() {
+        let w = rfc8448_wire();
+        let c_ap = rfc8448::hex_arr::<32>(rfc8448::C_AP);
+        let s_ap = rfc8448::hex_arr::<32>(rfc8448::S_AP);
+
+        let prover = TlsTranscript::builder()
+            .time(0)
+            .tls_sent(&w.tls_sent)
+            .tls_recv(&w.tls_recv)
+            .handshake_secrets(w.c_hs, w.s_hs)
+            .tls13_app_secrets(c_ap, s_ap)
+            .build()
+            .unwrap();
+        let metadata = prover.tls13_record_metadata();
+
+        // Round-trip through bincode (the serio mux codec used by the seam).
+        let bytes = bincode::serialize(&metadata).unwrap();
+        let metadata: Tls13Metadata = bincode::deserialize(&bytes).unwrap();
+
+        let verifier = TlsTranscript::builder()
+            .time(0)
+            .tls_sent(&w.tls_sent)
+            .tls_recv(&w.tls_recv)
+            .handshake_secrets(w.c_hs, w.s_hs)
+            .tls13_record_meta(metadata)
+            .build()
+            .unwrap();
+
+        for (p, v) in prover.sent().iter().zip(verifier.sent()) {
+            assert_eq!(v.typ, p.typ);
+            assert_eq!(v.content_len, p.content_len);
+            assert!(v.plaintext.is_none());
+            assert_eq!(v.ciphertext, p.ciphertext);
+        }
+        for (p, v) in prover.recv().iter().zip(verifier.recv()) {
+            assert_eq!(v.typ, p.typ);
+            assert_eq!(v.content_len, p.content_len);
+            assert!(v.plaintext.is_none());
+            assert_eq!(v.ciphertext, p.ciphertext);
+        }
+    }
+
+    /// `parse_records_tls13` framing on synthetic, self-sealed records that
+    /// include *padding* and a non-application-data inner type, across the
+    /// three framing modes. The `Decrypt` (prover) and `Inner` (pre-decrypted)
+    /// modes recover the content + boundary; the `Meta` (verifier) mode frames
+    /// the same `typ`/`content_len` from the declared metadata without keys.
+    #[test]
+    fn test_tls13_parse_records_framing_synthetic() {
+        let (key, iv) = traffic_keys(&rfc8448::hex_arr::<32>(rfc8448::C_AP));
+
+        // (inner type, content_len, padding) per app-epoch record.
+        let specs = [(0x17u8, 40usize, 5usize), (0x16u8, 20usize, 3usize)];
+
+        let mut wire = Vec::new();
+        let mut inner_stream = Vec::new();
+        let mut metas = Vec::new();
+        for (seq, &(typ, content_len, pad)) in specs.iter().enumerate() {
+            let content: Vec<u8> = (0..content_len).map(|i| (seq * 100 + i) as u8).collect();
+            let mut inner = content.clone();
+            inner.push(typ);
+            inner.resize(content_len + 1 + pad, 0u8);
+            let body = super::super::tls13::seal_record_inner(&key, &iv, seq as u64, &inner);
+            wire.extend_from_slice(&rfc8448::record(0x17, &body));
+            inner_stream.extend_from_slice(&inner);
+            metas.push(Tls13RecordMeta {
+                typ,
+                content_len: content_len as u32,
+            });
+        }
+
+        let records = parse_raw_records(&wire).unwrap();
+
+        // Prover (decrypt) and pre-decrypted (inner) framing must agree.
+        let by_decrypt =
+            parse_records_tls13(&records, Tls13Framing::Decrypt { key, iv }, 0).unwrap();
+        let by_inner =
+            parse_records_tls13(&records, Tls13Framing::Inner(&inner_stream), 0).unwrap();
+        // Verifier (metadata) framing recovers `typ`/`content_len`, no plaintext.
+        let by_meta = parse_records_tls13(&records, Tls13Framing::Meta(&metas), 0).unwrap();
+
+        for (i, &(typ, content_len, _pad)) in specs.iter().enumerate() {
+            let expected_typ = inner_content_type(typ);
+            assert_eq!(by_decrypt[i].typ, expected_typ);
+            assert_eq!(by_decrypt[i].content_len, Some(content_len));
+            assert_eq!(
+                by_decrypt[i].plaintext.as_ref().map(|p| p.len()),
+                Some(content_len)
+            );
+
+            assert_eq!(by_inner[i].typ, expected_typ);
+            assert_eq!(by_inner[i].content_len, Some(content_len));
+            assert_eq!(by_inner[i].plaintext, by_decrypt[i].plaintext);
+
+            assert_eq!(by_meta[i].typ, expected_typ);
+            assert_eq!(by_meta[i].content_len, Some(content_len));
+            assert!(by_meta[i].plaintext.is_none());
+        }
+
+        // A metadata list whose length disagrees with the records is rejected.
+        let short = [metas[0]];
+        assert!(parse_records_tls13(&records, Tls13Framing::Meta(&short), 0).is_err());
+
+        // A declared content length that exceeds the inner plaintext is rejected.
+        let bad = [
+            metas[0],
+            Tls13RecordMeta {
+                typ: 0x16,
+                content_len: 10_000,
+            },
+        ];
+        assert!(parse_records_tls13(&records, Tls13Framing::Meta(&bad), 0).is_err());
     }
 }

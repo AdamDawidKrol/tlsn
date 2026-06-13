@@ -7,9 +7,10 @@ use hmac_sha256::{KeySchedule13, Prf};
 use mpz_common::Context;
 use mpz_memory_core::MemoryExt;
 use mpz_vm_core::Execute;
+use serio::stream::IoStreamExt;
 use tlsn_core::{
     connection::TlsVersion,
-    transcript::{TlsTranscript, peek_tls_version_and_sh_hash},
+    transcript::{Tls13Metadata, TlsTranscript, peek_tls_version_and_sh_hash},
 };
 
 /// The verifier's finalize output. The two verify-data checks are `Some` only
@@ -250,13 +251,29 @@ impl ProxyVerifier {
             .map_err(|e| TlsnError::internal().with_source(e))?
             .ok_or(TlsnError::internal().with_msg("unable to receive s_hs from decoding"))?;
 
+        // Metadata channel (metadata-channel spec §2/§3), finalize-time mux
+        // seam: receive the prover's per-record `(inner_type, content_len)`
+        // framing over the shared proxy IO channel. The verifier cannot decrypt
+        // the app-epoch records (its application keys are blind in ZK), so it
+        // frames `Record.typ`/`content_len` from this metadata. It is a hint —
+        // the `type || padding` suffix proof later validates it (spec §5), so a
+        // mis-declared type/boundary fails the consistency proof at `verify`.
+        let metadata: Tls13Metadata = self.ctx.io_mut().expect_next().await.map_err(|e| {
+            TlsnError::internal()
+                .with_msg("verifier could not receive tls 1.3 record metadata")
+                .with_source(e)
+        })?;
+
         // Build the transcript, decrypting the handshake flight with the
-        // learned secrets. This also computes `h3`.
+        // learned secrets. This also computes `h3`. The app-epoch records are
+        // framed from the prover-declared metadata (the verifier has no
+        // application keys).
         let tls_transcript = TlsTranscript::builder()
             .time(conn_time)
             .tls_sent(sent)
             .tls_recv(recv)
             .handshake_secrets(c_hs, s_hs)
+            .tls13_record_meta(metadata)
             .build()
             .map_err(|e| {
                 TlsnError::internal()

@@ -324,6 +324,7 @@ mod tests {
             explicit_nonce: Vec::new(),
             ciphertext,
             tag: Some(tag),
+            content_len: None,
         }
     }
 
@@ -351,6 +352,7 @@ mod tests {
             explicit_nonce: explicit_nonce.to_vec(),
             ciphertext,
             tag: Some(tag),
+            content_len: None,
         }
     }
 
