@@ -15,7 +15,11 @@ use tlsn_core::{
 
 use crate::{
     Error, Result,
-    transcript_internal::{TranscriptRefs, auth::verify_plaintext, commit::hash::verify_hash},
+    transcript_internal::{
+        TranscriptRefs,
+        auth::{CipherParams, verify_plaintext},
+        commit::hash::verify_hash,
+    },
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -29,8 +33,17 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
     handshake: Option<(ServerName, HandshakeData)>,
     transcript: Option<PartialTranscript>,
 ) -> Result<VerifierOutput> {
+    // Full wire ciphertext (record-ciphertext coordinates) for the consistency
+    // proof: TLS 1.2 has `inner_len == content_len`, so this also equals the
+    // application-content length. For TLS 1.3 it is larger (it includes each
+    // record's inner `type || padding` suffix); the transcript-length check
+    // below must therefore compare against the content length, not this.
     let ciphertext_sent = collect_ciphertext(tls_transcript.sent());
     let ciphertext_recv = collect_ciphertext(tls_transcript.recv());
+
+    // §2.6: application-content length per direction.
+    let content_len_sent = content_len(tls_transcript.sent());
+    let content_len_recv = content_len(tls_transcript.recv());
 
     let transcript = if let Some((auth_sent, auth_recv)) = request.reveal() {
         let Some(transcript) = transcript else {
@@ -39,8 +52,8 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
             ));
         };
 
-        if transcript.len_sent() != ciphertext_sent.len()
-            || transcript.len_received() != ciphertext_recv.len()
+        if transcript.len_sent() != content_len_sent
+            || transcript.len_received() != content_len_recv
         {
             return Err(
                 Error::internal().with_msg("verification failed: transcript length mismatch")
@@ -59,7 +72,8 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
 
         transcript
     } else {
-        PartialTranscript::new(ciphertext_sent.len(), ciphertext_recv.len())
+        // The `PartialTranscript` is indexed in application-content coordinates.
+        PartialTranscript::new(content_len_sent, content_len_recv)
     };
 
     let server_name = if let Some((name, cert_data)) = handshake {
@@ -98,10 +112,15 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
             });
     }
 
+    // TODO(item 8): V1_3 SessionKeys. `mpc_tls::SessionKeys` only exposes the
+    // 4-byte TLS 1.2 implicit IV; wiring the 12-byte 1.3 IV (and selecting
+    // `CipherParams::V1_3`) is item 8 (parent spec §8 / open-question §4).
     let (sent_refs, sent_proof) = verify_plaintext(
         vm,
-        keys.client_write_key,
-        keys.client_write_iv,
+        CipherParams::V1_2 {
+            key: keys.client_write_key,
+            iv: keys.client_write_iv,
+        },
         transcript.sent_unsafe(),
         &ciphertext_sent,
         tls_transcript
@@ -118,8 +137,10 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
     })?;
     let (recv_refs, recv_proof) = verify_plaintext(
         vm,
-        keys.server_write_key,
-        keys.server_write_iv,
+        CipherParams::V1_2 {
+            key: keys.server_write_key,
+            iv: keys.server_write_iv,
+        },
         transcript.received_unsafe(),
         &ciphertext_recv,
         tls_transcript
@@ -197,4 +218,26 @@ fn collect_ciphertext<'a>(records: impl IntoIterator<Item = &'a Record>) -> Vec<
             ciphertext.extend_from_slice(&record.ciphertext);
         });
     ciphertext
+}
+
+/// Sum of application-content lengths across app-data records (§2.6).
+///
+/// The application transcript counts only inner **content** bytes, so the
+/// transcript-length check compares against this rather than the raw wire
+/// ciphertext length ([`collect_ciphertext`]).
+///
+/// * TLS 1.2: there is no inner `type || padding`, so `content_len ==
+///   ciphertext.len()` per record and this equals the wire ciphertext length.
+/// * TLS 1.3 (TODO item 8): `content_len = inner_len - 1 - padding`, learned
+///   from the per-record `type || padding` suffix proof in
+///   `transcript_internal::auth` (§2.4). That per-record content length must be
+///   threaded in once the 1.3 finalize flow is wired; until then this matches
+///   the TLS 1.2 wire length, which is correct for the only path the call sites
+///   currently take (`CipherParams::V1_2`).
+fn content_len<'a>(records: impl IntoIterator<Item = &'a Record>) -> usize {
+    records
+        .into_iter()
+        .filter(|record| record.typ == ContentType::ApplicationData)
+        .map(|record| record.ciphertext.len())
+        .sum()
 }

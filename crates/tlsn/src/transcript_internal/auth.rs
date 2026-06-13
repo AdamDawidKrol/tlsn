@@ -17,10 +17,48 @@ use tlsn_core::transcript::Record;
 
 use crate::transcript_internal::ReferenceMap;
 
+/// The TLS 1.3 application-data inner content type (RFC 8446 §5.1).
+const APPLICATION_DATA: u8 = 0x17;
+/// AES-CTR counter for the first keystream block (J0 = 1 is reserved for the
+/// GHASH tag in both TLS 1.2 and 1.3, RFC 5288 / RFC 8446 §5.3).
+const START_CTR: u32 = 2;
+const BLOCK_SIZE: usize = 16;
+
+/// Version-tagged AEAD key material.
+///
+/// The TLS version is *derived from the IV width* rather than carried as a
+/// separate flag: TLS 1.2 records carry an 8-byte explicit nonce alongside a
+/// 4-byte implicit IV, whereas TLS 1.3 derives the 12-byte per-record nonce
+/// from the 12-byte IV and the record sequence number (RFC 8446 §5.3).
+pub(crate) enum CipherParams {
+    V1_2 {
+        key: Array<U8, 16>,
+        iv: Array<U8, 4>,
+    },
+    // Constructed by the TLS 1.3 finalize flow (item 8); until then the call
+    // sites stay on `V1_2` and this variant is exercised by the unit tests.
+    #[allow(dead_code)]
+    V1_3 {
+        key: Array<U8, 16>,
+        iv: Array<U8, 12>,
+    },
+}
+
+impl CipherParams {
+    fn key(&self) -> Array<U8, 16> {
+        match self {
+            CipherParams::V1_2 { key, .. } | CipherParams::V1_3 { key, .. } => *key,
+        }
+    }
+
+    fn is_v1_3(&self) -> bool {
+        matches!(self, CipherParams::V1_3 { .. })
+    }
+}
+
 pub(crate) fn prove_plaintext<'a>(
     vm: &mut dyn Vm<Binary>,
-    key: Array<U8, 16>,
-    iv: Array<U8, 4>,
+    cipher: CipherParams,
     plaintext: &[u8],
     records: impl IntoIterator<Item = &'a Record>,
     reveal: &RangeSet<usize>,
@@ -36,11 +74,18 @@ pub(crate) fn prove_plaintext<'a>(
     };
 
     let plaintext_refs = alloc_plaintext(vm, &alloc_ranges)?;
-    let records = RecordParams::from_iter(records).collect::<Vec<_>>();
+    let records = RecordParams::from_records(&cipher, records).collect::<Vec<_>>();
 
     if is_reveal_all {
-        drop(vm.decode(key).map_err(PlaintextAuthError::vm)?);
-        drop(vm.decode(iv).map_err(PlaintextAuthError::vm)?);
+        drop(vm.decode(cipher.key()).map_err(PlaintextAuthError::vm)?);
+        match &cipher {
+            CipherParams::V1_2 { iv, .. } => {
+                drop(vm.decode(*iv).map_err(PlaintextAuthError::vm)?);
+            }
+            CipherParams::V1_3 { iv, .. } => {
+                drop(vm.decode(*iv).map_err(PlaintextAuthError::vm)?);
+            }
+        }
 
         for (range, slice) in plaintext_refs.iter() {
             vm.mark_public(*slice).map_err(PlaintextAuthError::vm)?;
@@ -72,7 +117,11 @@ pub(crate) fn prove_plaintext<'a>(
             vm.commit(*slice).map_err(PlaintextAuthError::vm)?;
         }
 
-        let ciphertext = alloc_ciphertext(vm, key, iv, plaintext_refs.clone(), &records)?;
+        // Translate the content references into record-ciphertext coordinates and
+        // append the per-record `type || padding` suffix (TLS 1.3); identity for
+        // TLS 1.2.
+        let cipher_refs = build_cipher_refs(vm, &cipher, &plaintext_refs, &records)?;
+        let ciphertext = alloc_ciphertext(vm, &cipher, cipher_refs, &records)?;
         for (_, slice) in ciphertext.iter() {
             drop(vm.decode(*slice).map_err(PlaintextAuthError::vm)?);
         }
@@ -84,8 +133,7 @@ pub(crate) fn prove_plaintext<'a>(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_plaintext<'a>(
     vm: &mut dyn Vm<Binary>,
-    key: Array<U8, 16>,
-    iv: Array<U8, 4>,
+    cipher: CipherParams,
     plaintext: &'a [u8],
     ciphertext: &'a [u8],
     records: impl IntoIterator<Item = &'a Record>,
@@ -102,11 +150,18 @@ pub(crate) fn verify_plaintext<'a>(
     };
 
     let plaintext_refs = alloc_plaintext(vm, &alloc_ranges)?;
-    let records = RecordParams::from_iter(records).collect::<Vec<_>>();
+    let records = RecordParams::from_records(&cipher, records).collect::<Vec<_>>();
 
     let plaintext_proof = if is_reveal_all {
-        let key = vm.decode(key).map_err(PlaintextAuthError::vm)?;
-        let iv = vm.decode(iv).map_err(PlaintextAuthError::vm)?;
+        let key = vm.decode(cipher.key()).map_err(PlaintextAuthError::vm)?;
+        let iv = match &cipher {
+            CipherParams::V1_2 { iv, .. } => {
+                IvDecode::V1_2(vm.decode(*iv).map_err(PlaintextAuthError::vm)?)
+            }
+            CipherParams::V1_3 { iv, .. } => {
+                IvDecode::V1_3(vm.decode(*iv).map_err(PlaintextAuthError::vm)?)
+            }
+        };
 
         for (range, slice) in plaintext_refs.iter() {
             vm.mark_public(*slice).map_err(PlaintextAuthError::vm)?;
@@ -146,8 +201,14 @@ pub(crate) fn verify_plaintext<'a>(
             vm.commit(*slice).map_err(PlaintextAuthError::vm)?;
         }
 
-        let ciphertext_map = alloc_ciphertext(vm, key, iv, plaintext_refs.clone(), &records)?;
+        let cipher_refs = build_cipher_refs(vm, &cipher, &plaintext_refs, &records)?;
+        let ciphertext_map = alloc_ciphertext(vm, &cipher, cipher_refs, &records)?;
 
+        // The decoded in-VM ciphertext (content XOR keystream plus, for TLS 1.3,
+        // the public `type || padding` suffix XOR keystream) is compared against
+        // the wire ciphertext in record-ciphertext coordinates. A suffix whose
+        // type byte is not `0x17`, whose padding is non-zero, or whose content
+        // boundary the prover misdeclared therefore fails as `InvalidPlaintext`.
         let mut ciphertexts = Vec::new();
         for (range, chunk) in ciphertext_map.iter() {
             ciphertexts.push((
@@ -184,12 +245,78 @@ fn alloc_plaintext(
     })))
 }
 
-fn alloc_ciphertext<'a>(
+/// Translates the content `plaintext_refs` (transcript coordinates) into
+/// record-ciphertext coordinates and, for TLS 1.3, appends the per-record
+/// `type || padding` suffix references.
+///
+/// For TLS 1.2 `content_len == inner_len` and the transcript base equals the
+/// record-ciphertext base for every record, so the mapping is the identity and
+/// the original references are returned unchanged. For TLS 1.3 each content
+/// reference is split at record boundaries and shifted by the running gap
+/// between transcript coordinates (sum of `content_len`) and record-ciphertext
+/// coordinates (sum of `inner_len`). The returned map references the *same* VM
+/// slices for content (so commitments stay consistent) but is keyed in
+/// record-ciphertext coordinates for the keystream/consistency proof; the
+/// caller keeps `plaintext_refs` for transcript-coordinate commitment logic.
+fn build_cipher_refs(
     vm: &mut dyn Vm<Binary>,
-    key: Array<U8, 16>,
-    iv: Array<U8, 4>,
+    cipher: &CipherParams,
+    plaintext_refs: &ReferenceMap,
+    records: &[RecordParams],
+) -> Result<ReferenceMap, PlaintextAuthError> {
+    if !cipher.is_v1_3() {
+        return Ok(plaintext_refs.clone());
+    }
+
+    let mut entries: Vec<(usize, Vector<U8>)> = Vec::new();
+    let mut t_base = 0;
+    let mut c_base = 0;
+    for record in records {
+        // Content lives at the start of the inner plaintext, so a transcript
+        // offset `o` maps to record-ciphertext offset `o` within the record.
+        for (range, _) in plaintext_refs.iter() {
+            let start = range.start.max(t_base);
+            let end = range.end.min(t_base + record.content_len);
+            if start < end {
+                let slice = plaintext_refs
+                    .get(start..end)
+                    .expect("content range is within an allocated reference");
+                entries.push((c_base + (start - t_base), slice));
+            }
+        }
+
+        // The trailing `type || padding` suffix is public and always proven.
+        let suffix_len = record.inner_len - record.content_len;
+        if suffix_len > 0 {
+            let suffix = alloc_suffix(vm, suffix_len)?;
+            entries.push((c_base + record.content_len, suffix));
+        }
+
+        t_base += record.content_len;
+        c_base += record.inner_len;
+    }
+
+    Ok(ReferenceMap::from_iter(entries))
+}
+
+/// Allocates and publicly assigns a TLS 1.3 record suffix `0x17 || 0x00*p`
+/// (inner type `application_data` followed by zero padding).
+fn alloc_suffix(vm: &mut dyn Vm<Binary>, len: usize) -> Result<Vector<U8>, PlaintextAuthError> {
+    let suffix = vm.alloc_vec::<U8>(len).map_err(PlaintextAuthError::vm)?;
+    vm.mark_public(suffix).map_err(PlaintextAuthError::vm)?;
+    let mut bytes = vec![0u8; len];
+    bytes[0] = APPLICATION_DATA;
+    vm.assign(suffix, bytes).map_err(PlaintextAuthError::vm)?;
+    vm.commit(suffix).map_err(PlaintextAuthError::vm)?;
+
+    Ok(suffix)
+}
+
+fn alloc_ciphertext(
+    vm: &mut dyn Vm<Binary>,
+    cipher: &CipherParams,
     plaintext: ReferenceMap,
-    records: impl IntoIterator<Item = &'a RecordParams>,
+    records: &[RecordParams],
 ) -> Result<ReferenceMap, PlaintextAuthError> {
     if plaintext.is_empty() {
         return Ok(ReferenceMap::default());
@@ -197,7 +324,7 @@ fn alloc_ciphertext<'a>(
 
     let ranges = RangeSet::from(plaintext.keys().collect::<Vec<_>>());
 
-    let keystream = alloc_keystream(vm, key, iv, &ranges, records)?;
+    let keystream = alloc_keystream(vm, cipher, &ranges, records)?;
     let mut builder = Call::builder(Arc::new(xor(ranges.len() * 8)));
     for (_, slice) in plaintext.iter() {
         builder = builder.arg(*slice);
@@ -219,27 +346,30 @@ fn alloc_ciphertext<'a>(
     })))
 }
 
-fn alloc_keystream<'a>(
+/// Allocates the AES-CTR keystream covering `ranges`, expressed in
+/// record-ciphertext coordinates (i.e. `record.inner_len` per record).
+fn alloc_keystream(
     vm: &mut dyn Vm<Binary>,
-    key: Array<U8, 16>,
-    iv: Array<U8, 4>,
+    cipher: &CipherParams,
     ranges: &RangeSet<usize>,
-    records: impl IntoIterator<Item = &'a RecordParams>,
+    records: &[RecordParams],
 ) -> Result<Vec<Vector<U8>>, PlaintextAuthError> {
+    let key = cipher.key();
     let mut keystream = Vec::new();
 
     let mut pos = 0;
     let mut range_iter = ranges.iter();
     let mut current_range = range_iter.next();
     for record in records {
-        let mut explicit_nonce = None;
+        // The per-record nonce is shared across that record's blocks.
+        let mut nonce: Option<(Vector<U8>, Vector<U8>)> = None;
         let mut current_block = None;
         loop {
             let Some(range) = current_range.take().or_else(|| range_iter.next()) else {
                 return Ok(keystream);
             };
 
-            let record_range = pos..pos + record.len;
+            let record_range = pos..pos + record.inner_len;
             if range.start >= record_range.end {
                 current_range = Some(range);
                 break;
@@ -248,22 +378,21 @@ fn alloc_keystream<'a>(
             // Range with record offset applied.
             let offset_range = range.start - pos..range.end - pos;
 
-            let explicit_nonce = if let Some(explicit_nonce) = explicit_nonce {
-                explicit_nonce
-            } else {
-                let nonce = alloc_explicit_nonce(vm, record.explicit_nonce.clone())?;
-                explicit_nonce = Some(nonce);
+            let (iv_part, nonce_part) = if let Some(nonce) = nonce {
                 nonce
+            } else {
+                let parts = alloc_nonce(vm, cipher, record)?;
+                nonce = Some(parts);
+                parts
             };
 
-            const BLOCK_SIZE: usize = 16;
             let block_num = offset_range.start / BLOCK_SIZE;
             let block = if let Some((current_block_num, block)) = current_block.take()
                 && current_block_num == block_num
             {
                 block
             } else {
-                let block = alloc_block(vm, key, iv, explicit_nonce, block_num)?;
+                let block = alloc_block(vm, key, iv_part, nonce_part, block_num)?;
                 current_block = Some((block_num, block));
                 block
             };
@@ -282,10 +411,38 @@ fn alloc_keystream<'a>(
             }
         }
 
-        pos += record.len;
+        pos += record.inner_len;
     }
 
     Err(ErrorRepr::OutOfBounds.into())
+}
+
+/// Allocates the per-record AES input nonce, split into the 4-byte and 8-byte
+/// slices the `AES128` circuit consumes (it concatenates `iv(4) || nonce(8) ||
+/// ctr(4)` into the 16-byte input block).
+///
+/// * TLS 1.2: `(implicit_iv4, explicit_nonce8)`.
+/// * TLS 1.3: `nonce12 = iv12 XOR (0^4 || seq_be64)` (RFC 8446 §5.3), sliced
+///   into `nonce12[0..4]` and `nonce12[4..12]`. This is the same in-VM XOR /
+///   slice-into-`AES128` technique validated in item 3
+///   (`crates/components/cipher/src/aes/mod.rs`).
+fn alloc_nonce(
+    vm: &mut dyn Vm<Binary>,
+    cipher: &CipherParams,
+    record: &RecordParams,
+) -> Result<(Vector<U8>, Vector<U8>), PlaintextAuthError> {
+    match cipher {
+        CipherParams::V1_2 { iv, .. } => {
+            let explicit_nonce = alloc_explicit_nonce(vm, record.explicit_nonce.clone())?;
+            Ok((Vector::from(*iv), explicit_nonce))
+        }
+        CipherParams::V1_3 { iv, .. } => {
+            let nonce12 = alloc_tls13_nonce(vm, *iv, record.seq)?;
+            let iv_part = nonce12.get(0..4).expect("nonce slice 0..4 is in bounds");
+            let nonce_part = nonce12.get(4..12).expect("nonce slice 4..12 is in bounds");
+            Ok((iv_part, nonce_part))
+        }
+    }
 }
 
 fn alloc_explicit_nonce(
@@ -304,26 +461,61 @@ fn alloc_explicit_nonce(
     Ok(nonce)
 }
 
+/// Computes the TLS 1.3 per-record AEAD nonce in the VM:
+/// `nonce12 = iv12 XOR (0x00000000 || seq.to_be_bytes())`.
+fn alloc_tls13_nonce(
+    vm: &mut dyn Vm<Binary>,
+    iv: Array<U8, 12>,
+    seq: u64,
+) -> Result<Vector<U8>, PlaintextAuthError> {
+    let seq_pad: Array<U8, 12> = vm.alloc().map_err(PlaintextAuthError::vm)?;
+    vm.mark_public(seq_pad).map_err(PlaintextAuthError::vm)?;
+    vm.assign(seq_pad, tls13_seq_pad(seq))
+        .map_err(PlaintextAuthError::vm)?;
+    vm.commit(seq_pad).map_err(PlaintextAuthError::vm)?;
+
+    let nonce12: Vector<U8> = vm
+        .call(
+            Call::builder(Arc::new(xor(96)))
+                .arg(iv)
+                .arg(seq_pad)
+                .build()
+                .expect("xor call should be valid"),
+        )
+        .map_err(PlaintextAuthError::vm)?;
+
+    Ok(nonce12)
+}
+
+/// Builds the TLS 1.3 sequence-number pad `0x00000000 || seq.to_be_bytes()`.
+fn tls13_seq_pad(seq: u64) -> [u8; 12] {
+    let mut seq_pad = [0u8; 12];
+    seq_pad[4..12].copy_from_slice(&seq.to_be_bytes());
+    seq_pad
+}
+
 fn alloc_block(
     vm: &mut dyn Vm<Binary>,
     key: Array<U8, 16>,
-    iv: Array<U8, 4>,
-    explicit_nonce: Vector<U8>,
+    iv: Vector<U8>,
+    nonce: Vector<U8>,
     block: usize,
 ) -> Result<Vector<U8>, PlaintextAuthError> {
     let ctr: Array<U8, 4> = vm.alloc().map_err(PlaintextAuthError::vm)?;
     vm.mark_public(ctr).map_err(PlaintextAuthError::vm)?;
-    const START_CTR: u32 = 2;
     vm.assign(ctr, (START_CTR + block as u32).to_be_bytes())
         .map_err(PlaintextAuthError::vm)?;
     vm.commit(ctr).map_err(PlaintextAuthError::vm)?;
 
+    // `Call` matches arguments by bit-length, so feeding `Vector<U8>` slices into
+    // the iv(4) / nonce(8) slots the 1.2 path fills with `Array<U8, 4>` /
+    // `Array<U8, 8>` is sound (see item 3's `AES128_POST_KS` usage).
     let block: Array<U8, 16> = vm
         .call(
             Call::builder(AES128.clone())
                 .arg(key)
                 .arg(iv)
-                .arg(explicit_nonce)
+                .arg(nonce)
                 .arg(ctr)
                 .build()
                 .expect("call should be valid"),
@@ -334,15 +526,53 @@ fn alloc_block(
 }
 
 struct RecordParams {
+    /// TLS 1.2 explicit nonce (8 bytes); empty/ignored for TLS 1.3.
     explicit_nonce: Vec<u8>,
-    len: usize,
+    /// TLS 1.3 per-epoch sequence number used to derive the nonce; ignored for
+    /// TLS 1.2.
+    seq: u64,
+    /// Full inner-plaintext length (`record.ciphertext.len()`).
+    inner_len: usize,
+    /// Application-content length. TLS 1.2: `content_len == inner_len`. TLS
+    /// 1.3: `inner_len - 1 - padding`, i.e. the inner plaintext minus the
+    /// 1-byte content type and trailing zero padding.
+    content_len: usize,
 }
 
 impl RecordParams {
-    fn from_iter<'a>(records: impl IntoIterator<Item = &'a Record>) -> impl Iterator<Item = Self> {
-        records.into_iter().map(|record| Self {
-            explicit_nonce: record.explicit_nonce.clone(),
-            len: record.ciphertext.len(),
+    /// Builds [`RecordParams`] from the app-data record list.
+    ///
+    /// `content_len` determination:
+    /// * TLS 1.2: there is no inner type/padding, so `content_len ==
+    ///   inner_len`.
+    /// * TLS 1.3 prover: the content length is known from the decrypted content
+    ///   (`record.plaintext`).
+    /// * TLS 1.3 verifier: `record.plaintext` is absent; the content boundary
+    ///   is public metadata conveyed by the prover (the padding length, parent
+    ///   §10 open-question 5) and is *validated* by the `type || padding`
+    ///   suffix proof — a misdeclared boundary makes the disclosed suffix fail
+    ///   to match the wire ciphertext. Wiring that metadata through the
+    ///   finalize flow is item 8; until then this falls back to `inner_len` and
+    ///   1.3 is exercised via the unit tests that construct [`RecordParams`]
+    ///   directly.
+    fn from_records<'a>(
+        cipher: &CipherParams,
+        records: impl IntoIterator<Item = &'a Record>,
+    ) -> impl Iterator<Item = Self> {
+        let is_v1_3 = cipher.is_v1_3();
+        records.into_iter().map(move |record| {
+            let inner_len = record.ciphertext.len();
+            let content_len = if is_v1_3 {
+                record.plaintext.as_ref().map_or(inner_len, |p| p.len())
+            } else {
+                inner_len
+            };
+            Self {
+                explicit_nonce: record.explicit_nonce.clone(),
+                seq: record.seq,
+                inner_len,
+                content_len,
+            }
         })
     }
 }
@@ -355,7 +585,7 @@ impl<'a> PlaintextProof<'a> {
         match self.0 {
             ProofInner::WithKey {
                 mut key,
-                mut iv,
+                iv,
                 records,
                 plaintext,
                 ciphertext,
@@ -364,12 +594,24 @@ impl<'a> PlaintextProof<'a> {
                     .try_recv()
                     .map_err(PlaintextAuthError::vm)?
                     .ok_or(ErrorRepr::MissingDecoding)?;
-                let iv = iv
-                    .try_recv()
-                    .map_err(PlaintextAuthError::vm)?
-                    .ok_or(ErrorRepr::MissingDecoding)?;
+                let cipher = match iv {
+                    IvDecode::V1_2(mut iv) => {
+                        let iv = iv
+                            .try_recv()
+                            .map_err(PlaintextAuthError::vm)?
+                            .ok_or(ErrorRepr::MissingDecoding)?;
+                        SoftCipher::V1_2 { key, iv }
+                    }
+                    IvDecode::V1_3(mut iv) => {
+                        let iv = iv
+                            .try_recv()
+                            .map_err(PlaintextAuthError::vm)?
+                            .ok_or(ErrorRepr::MissingDecoding)?;
+                        SoftCipher::V1_3 { key, iv }
+                    }
+                };
 
-                verify_plaintext_with_key(key, iv, &records, plaintext, ciphertext)?;
+                verify_plaintext_with_key(&cipher, &records, plaintext, ciphertext)?;
             }
             ProofInner::WithZk { ciphertexts } => {
                 for (expected, mut actual) in ciphertexts {
@@ -389,10 +631,16 @@ impl<'a> PlaintextProof<'a> {
     }
 }
 
+/// Decoded write IV, version-tagged to match [`CipherParams`].
+enum IvDecode {
+    V1_2(DecodeFutureTyped<BitVec, [u8; 4]>),
+    V1_3(DecodeFutureTyped<BitVec, [u8; 12]>),
+}
+
 enum ProofInner<'a> {
     WithKey {
         key: DecodeFutureTyped<BitVec, [u8; 16]>,
-        iv: DecodeFutureTyped<BitVec, [u8; 4]>,
+        iv: IvDecode,
         records: Vec<RecordParams>,
         plaintext: &'a [u8],
         ciphertext: &'a [u8],
@@ -404,12 +652,17 @@ enum ProofInner<'a> {
     },
 }
 
+/// Decoded AEAD key material for the software (revealed-key) consistency check.
+enum SoftCipher {
+    V1_2 { key: [u8; 16], iv: [u8; 4] },
+    V1_3 { key: [u8; 16], iv: [u8; 12] },
+}
+
 fn aes_ctr_apply_keystream(key: &[u8; 16], iv: &[u8; 4], explicit_nonce: &[u8], input: &mut [u8]) {
     let mut full_iv = [0u8; 16];
     full_iv[0..4].copy_from_slice(iv);
     full_iv[4..12].copy_from_slice(&explicit_nonce[..8]);
 
-    const START_CTR: u32 = 2;
     let mut cipher = Ctr32BE::<Aes128>::new(key.into(), &full_iv.into());
     cipher
         .try_seek(START_CTR * 16)
@@ -417,26 +670,64 @@ fn aes_ctr_apply_keystream(key: &[u8; 16], iv: &[u8; 4], explicit_nonce: &[u8], 
     cipher.apply_keystream(input);
 }
 
-fn verify_plaintext_with_key<'a>(
-    key: [u8; 16],
-    iv: [u8; 4],
-    records: impl IntoIterator<Item = &'a RecordParams>,
+/// TLS 1.3 software keystream: `nonce = iv12 XOR (0^4 || seq_be64)`, then the
+/// 16-byte CTR counter block is `nonce(12) || 0x00000000`, advanced to
+/// `START_CTR`.
+fn aes_ctr_apply_keystream_tls13(key: &[u8; 16], iv: &[u8; 12], seq: u64, input: &mut [u8]) {
+    let seq_pad = tls13_seq_pad(seq);
+    let mut full_iv = [0u8; 16];
+    for i in 0..12 {
+        full_iv[i] = iv[i] ^ seq_pad[i];
+    }
+
+    let mut cipher = Ctr32BE::<Aes128>::new(key.into(), &full_iv.into());
+    cipher
+        .try_seek(START_CTR * 16)
+        .expect("start counter is less than keystream length");
+    cipher.apply_keystream(input);
+}
+
+/// Software consistency check used by the revealed-key (full-reveal) path.
+///
+/// `plaintext` is the application content (transcript coordinates,
+/// `content_len` per record); `ciphertext` is the wire ciphertext
+/// (record-ciphertext coordinates, `inner_len` per record). For TLS 1.3 the
+/// inner plaintext is reconstructed as `content || 0x17 || 0x00*padding` before
+/// applying the keystream, so a wrong content boundary, inner type, or padding
+/// all surface as an `InvalidPlaintext` mismatch against the authenticated wire
+/// ciphertext.
+fn verify_plaintext_with_key(
+    cipher: &SoftCipher,
+    records: &[RecordParams],
     plaintext: &[u8],
     ciphertext: &[u8],
 ) -> Result<(), PlaintextAuthError> {
-    let mut pos = 0;
+    let mut t_pos = 0;
+    let mut c_pos = 0;
     let mut text = Vec::new();
     for record in records {
         text.clear();
-        text.extend_from_slice(&plaintext[pos..pos + record.len]);
+        text.extend_from_slice(&plaintext[t_pos..t_pos + record.content_len]);
 
-        aes_ctr_apply_keystream(&key, &iv, &record.explicit_nonce, &mut text);
+        match cipher {
+            SoftCipher::V1_2 { key, iv } => {
+                debug_assert_eq!(record.content_len, record.inner_len);
+                aes_ctr_apply_keystream(key, iv, &record.explicit_nonce, &mut text);
+            }
+            SoftCipher::V1_3 { key, iv } => {
+                // Reconstruct the inner plaintext: content || type || padding.
+                text.push(APPLICATION_DATA);
+                text.resize(record.inner_len, 0u8);
+                aes_ctr_apply_keystream_tls13(key, iv, record.seq, &mut text);
+            }
+        }
 
-        if text != ciphertext[pos..pos + record.len] {
+        if text != ciphertext[c_pos..c_pos + record.inner_len] {
             return Err(PlaintextAuthError(ErrorRepr::InvalidPlaintext));
         }
 
-        pos += record.len;
+        t_pos += record.content_len;
+        c_pos += record.inner_len;
     }
 
     Ok(())
@@ -478,7 +769,7 @@ mod tests {
     use rstest::*;
     use std::ops::Range;
 
-    fn build_vm(key: [u8; 16], iv: [u8; 4]) -> (IdealVm, Array<U8, 16>, Array<U8, 4>) {
+    fn build_vm(key: [u8; 16], iv: [u8; 4]) -> (IdealVm, CipherParams) {
         let mut vm = IdealVm::new();
         let key_ref = vm.alloc::<Array<U8, 16>>().unwrap();
         let iv_ref = vm.alloc::<Array<U8, 4>>().unwrap();
@@ -490,7 +781,34 @@ mod tests {
         vm.commit(key_ref).unwrap();
         vm.commit(iv_ref).unwrap();
 
-        (vm, key_ref, iv_ref)
+        (
+            vm,
+            CipherParams::V1_2 {
+                key: key_ref,
+                iv: iv_ref,
+            },
+        )
+    }
+
+    fn build_vm_tls13(key: [u8; 16], iv: [u8; 12]) -> (IdealVm, CipherParams) {
+        let mut vm = IdealVm::new();
+        let key_ref = vm.alloc::<Array<U8, 16>>().unwrap();
+        let iv_ref = vm.alloc::<Array<U8, 12>>().unwrap();
+
+        vm.mark_public(key_ref).unwrap();
+        vm.mark_public(iv_ref).unwrap();
+        vm.assign(key_ref, key).unwrap();
+        vm.assign(iv_ref, iv).unwrap();
+        vm.commit(key_ref).unwrap();
+        vm.commit(iv_ref).unwrap();
+
+        (
+            vm,
+            CipherParams::V1_3 {
+                key: key_ref,
+                iv: iv_ref,
+            },
+        )
     }
 
     fn expected_aes_ctr<'a>(
@@ -502,17 +820,42 @@ mod tests {
         let mut keystream = Vec::new();
         let mut pos = 0;
         for record in records {
-            let mut record_keystream = vec![0u8; record.len];
+            let mut record_keystream = vec![0u8; record.inner_len];
             aes_ctr_apply_keystream(&key, &iv, &record.explicit_nonce, &mut record_keystream);
             for mut range in ranges.iter() {
                 range.start = range.start.max(pos);
-                range.end = range.end.min(pos + record.len);
+                range.end = range.end.min(pos + record.inner_len);
                 if range.start < range.end {
                     keystream
                         .extend_from_slice(&record_keystream[range.start - pos..range.end - pos]);
                 }
             }
-            pos += record.len;
+            pos += record.inner_len;
+        }
+
+        keystream
+    }
+
+    fn expected_aes_ctr_tls13<'a>(
+        key: [u8; 16],
+        iv: [u8; 12],
+        records: impl IntoIterator<Item = &'a RecordParams>,
+        ranges: &RangeSet<usize>,
+    ) -> Vec<u8> {
+        let mut keystream = Vec::new();
+        let mut pos = 0;
+        for record in records {
+            let mut record_keystream = vec![0u8; record.inner_len];
+            aes_ctr_apply_keystream_tls13(&key, &iv, record.seq, &mut record_keystream);
+            for mut range in ranges.iter() {
+                range.start = range.start.max(pos);
+                range.end = range.end.min(pos + record.inner_len);
+                if range.start < range.end {
+                    keystream
+                        .extend_from_slice(&record_keystream[range.start - pos..range.end - pos]);
+                }
+            }
+            pos += record.inner_len;
         }
 
         keystream
@@ -548,7 +891,9 @@ mod tests {
                 total_len += len;
                 RecordParams {
                     explicit_nonce: explicit_nonce.to_vec(),
-                    len,
+                    seq: 0,
+                    inner_len: len,
+                    content_len: len,
                 }
             })
             .collect::<Vec<_>>();
@@ -557,9 +902,9 @@ mod tests {
         let is_out_of_bounds = ranges.end().unwrap_or(0) > total_len;
 
         let (mut ctx, _) = test_st_context(1024);
-        let (mut vm, key_ref, iv_ref) = build_vm(key, iv);
+        let (mut vm, cipher) = build_vm(key, iv);
 
-        let keystream = match alloc_keystream(&mut vm, key_ref, iv_ref, &ranges, &records) {
+        let keystream = match alloc_keystream(&mut vm, &cipher, &ranges, &records) {
             Ok(_) if is_out_of_bounds => panic!("should be out of bounds"),
             Ok(keystream) => keystream,
             Err(PlaintextAuthError(ErrorRepr::OutOfBounds)) if is_out_of_bounds => {
@@ -578,6 +923,77 @@ mod tests {
         assert_eq!(keystream.len(), ranges.len());
 
         let expected = expected_aes_ctr(key, iv, &records, &ranges);
+
+        assert_eq!(keystream, expected);
+    }
+
+    /// TLS 1.3 keystream over record-ciphertext coordinates: a 12-byte IV, a
+    /// `seq`-derived XOR nonce, and records whose `inner_len = content_len + 1
+    /// + p`. The in-VM keystream must equal the software reference.
+    #[rstest]
+    #[case::single_record_empty([(0, 0)], [])]
+    #[case::single_block_full([(10, 5)], [0..16])]
+    #[case::single_block_partial([(10, 5)], [2..14])]
+    #[case::partial_block_full([(8, 6)], [0..15])]
+    #[case::out_of_bounds([(10, 5)], [0..17])]
+    #[case::multiple_records_full([(120, 7), (60, 2), (30, 2), (10, 4), (3, 0)], [0..255])]
+    #[case::multiple_records_partial(
+        [(120, 7), (60, 2), (30, 2), (10, 4), (3, 0)],
+        [1..15, 16..17, 18..19, 126..130, 224..225, 254..255]
+    )]
+    #[tokio::test]
+    async fn test_alloc_keystream_tls13(
+        #[case] record_specs: impl IntoIterator<Item = (usize, usize)>,
+        #[case] ranges: impl IntoIterator<Item = Range<usize>>,
+    ) {
+        let mut rng = StdRng::seed_from_u64(0);
+        let mut key = [0u8; 16];
+        let mut iv = [0u8; 12];
+        rng.fill(&mut key);
+        rng.fill(&mut iv);
+
+        let mut total_len = 0;
+        let records = record_specs
+            .into_iter()
+            .enumerate()
+            .map(|(seq, (content_len, padding))| {
+                // inner_len = content || type(1) || padding(p).
+                let inner_len = content_len + 1 + padding;
+                total_len += inner_len;
+                RecordParams {
+                    explicit_nonce: Vec::new(),
+                    seq: seq as u64,
+                    inner_len,
+                    content_len,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let ranges = RangeSet::from(ranges.into_iter().collect::<Vec<_>>());
+        let is_out_of_bounds = ranges.end().unwrap_or(0) > total_len;
+
+        let (mut ctx, _) = test_st_context(1024);
+        let (mut vm, cipher) = build_vm_tls13(key, iv);
+
+        let keystream = match alloc_keystream(&mut vm, &cipher, &ranges, &records) {
+            Ok(_) if is_out_of_bounds => panic!("should be out of bounds"),
+            Ok(keystream) => keystream,
+            Err(PlaintextAuthError(ErrorRepr::OutOfBounds)) if is_out_of_bounds => {
+                return;
+            }
+            Err(e) => panic!("unexpected error: {:?}", e),
+        };
+
+        vm.execute(&mut ctx).await.unwrap();
+
+        let keystream: Vec<u8> = keystream
+            .iter()
+            .flat_map(|slice| vm.get(*slice).unwrap().unwrap())
+            .collect();
+
+        assert_eq!(keystream.len(), ranges.len());
+
+        let expected = expected_aes_ctr_tls13(key, iv, &records, &ranges);
 
         assert_eq!(keystream, expected);
     }
@@ -606,7 +1022,9 @@ mod tests {
                 total_len += len;
                 RecordParams {
                     explicit_nonce: explicit_nonce.to_vec(),
-                    len,
+                    seq: 0,
+                    inner_len: len,
+                    content_len: len,
                 }
             })
             .collect::<Vec<_>>();
@@ -626,10 +1044,192 @@ mod tests {
             plaintext.first_mut().map(|pt| *pt ^= 1);
         }
 
-        match verify_plaintext_with_key(key, iv, &records, &plaintext, &ciphertext) {
+        let cipher = SoftCipher::V1_2 { key, iv };
+        match verify_plaintext_with_key(&cipher, &records, &plaintext, &ciphertext) {
             Ok(_) if tamper && !plaintext.is_empty() => panic!("should be invalid"),
             Err(e) if !tamper => panic!("unexpected error: {:?}", e),
             _ => {}
         }
+    }
+
+    /// Negative kinds for the TLS 1.3 revealed-key consistency check.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Tls13Defect {
+        None,
+        /// Flip a content plaintext byte.
+        Content,
+        /// Encrypt an inner type byte other than `0x17`.
+        BadType,
+        /// Encrypt non-zero padding.
+        BadPadding,
+    }
+
+    /// TLS 1.3 full inner plaintexts `content || 0x17 || 0^p` are encrypted
+    /// with the seq-derived nonce; the revealed-key check must accept the
+    /// honest case and reject a tampered content byte, a non-`0x17` inner
+    /// type, or non-zero padding.
+    #[rstest]
+    #[case::single_record([(32, 3)])]
+    #[case::multiple_records([(128, 0), (63, 7), (33, 1), (15, 4)])]
+    #[case::multiple_records_with_empty([(128, 0), (0, 5), (15, 2)])]
+    #[case::no_padding([(40, 0), (10, 0)])]
+    fn test_verify_plaintext_with_key_tls13(
+        #[case] record_specs: impl IntoIterator<Item = (usize, usize)>,
+        #[values(
+            Tls13Defect::None,
+            Tls13Defect::Content,
+            Tls13Defect::BadType,
+            Tls13Defect::BadPadding
+        )]
+        defect: Tls13Defect,
+    ) {
+        let mut rng = StdRng::seed_from_u64(1);
+        let mut key = [0u8; 16];
+        let mut iv = [0u8; 12];
+        rng.fill(&mut key);
+        rng.fill(&mut iv);
+
+        let records = record_specs
+            .into_iter()
+            .enumerate()
+            .map(|(seq, (content_len, padding))| RecordParams {
+                explicit_nonce: Vec::new(),
+                seq: seq as u64,
+                inner_len: content_len + 1 + padding,
+                content_len,
+            })
+            .collect::<Vec<_>>();
+
+        // Application content (transcript coordinates).
+        let content_total = records.iter().map(|r| r.content_len).sum::<usize>();
+        let mut plaintext = vec![0u8; content_total];
+        rng.fill(plaintext.as_mut_slice());
+
+        // Build the wire ciphertext from the honest (or deliberately defective)
+        // inner plaintexts, then encrypt with the per-record nonce.
+        let mut ciphertext = Vec::new();
+        let mut t_pos = 0;
+        for record in &records {
+            let mut inner = Vec::with_capacity(record.inner_len);
+            inner.extend_from_slice(&plaintext[t_pos..t_pos + record.content_len]);
+            let type_byte = if defect == Tls13Defect::BadType {
+                0x16 // handshake, not application_data
+            } else {
+                APPLICATION_DATA
+            };
+            inner.push(type_byte);
+            inner.resize(record.inner_len, 0u8);
+            if defect == Tls13Defect::BadPadding && record.inner_len > record.content_len + 1 {
+                // Make the last padding byte non-zero.
+                *inner.last_mut().unwrap() = 0xAA;
+            }
+            aes_ctr_apply_keystream_tls13(&key, &iv, record.seq, &mut inner);
+            ciphertext.extend_from_slice(&inner);
+            t_pos += record.content_len;
+        }
+
+        if defect == Tls13Defect::Content {
+            // Flip a content byte (if any content exists).
+            if let Some(b) = plaintext.first_mut() {
+                *b ^= 1;
+            }
+        }
+
+        // Whether this defect should be detectable for the given records.
+        let expect_invalid = match defect {
+            Tls13Defect::None => false,
+            Tls13Defect::Content => content_total > 0,
+            Tls13Defect::BadType => true,
+            Tls13Defect::BadPadding => records.iter().any(|r| r.inner_len > r.content_len + 1),
+        };
+
+        let cipher = SoftCipher::V1_3 { key, iv };
+        match verify_plaintext_with_key(&cipher, &records, &plaintext, &ciphertext) {
+            Ok(_) if expect_invalid => panic!("should be invalid for defect {:?}", defect),
+            Err(e) if !expect_invalid => panic!("unexpected error: {:?} for {:?}", e, defect),
+            _ => {}
+        }
+    }
+
+    /// The transcript -> record-ciphertext coordinate translation: content
+    /// references shift by the running `inner_len - content_len` gap and never
+    /// cross into a suffix, suffix references occupy `[content_len, inner_len)`
+    /// per record, and `plaintext_refs` stay in transcript coordinates.
+    #[tokio::test]
+    async fn test_range_translation() {
+        // (content_len, padding) per record; inner_len = content_len + 1 + p.
+        let specs = [(128usize, 7usize), (63, 2), (33, 2), (15, 4), (4, 0)];
+        let records = specs
+            .iter()
+            .enumerate()
+            .map(|(seq, &(content_len, padding))| RecordParams {
+                explicit_nonce: Vec::new(),
+                seq: seq as u64,
+                inner_len: content_len + 1 + padding,
+                content_len,
+            })
+            .collect::<Vec<_>>();
+
+        // Transcript (content) coordinate ranges, mirroring `multiple_records_partial`.
+        // Content bases: 0, 128, 191, 224, 239 (total 243).
+        let content_ranges = RangeSet::from(vec![
+            1..15,    // record 0
+            126..130, // spans record 0 (..128) and record 1 (128..)
+            191..192, // start of record 2
+            239..243, // record 4 (last)
+        ]);
+
+        let mut vm = IdealVm::new();
+        let key_ref = vm.alloc::<Array<U8, 16>>().unwrap();
+        let iv_ref = vm.alloc::<Array<U8, 12>>().unwrap();
+        vm.mark_public(key_ref).unwrap();
+        vm.mark_public(iv_ref).unwrap();
+        vm.assign(key_ref, [0u8; 16]).unwrap();
+        vm.assign(iv_ref, [0u8; 12]).unwrap();
+        vm.commit(key_ref).unwrap();
+        vm.commit(iv_ref).unwrap();
+        let cipher = CipherParams::V1_3 {
+            key: key_ref,
+            iv: iv_ref,
+        };
+
+        let plaintext_refs = alloc_plaintext(&mut vm, &content_ranges).unwrap();
+
+        // `plaintext_refs` keys are unchanged transcript coordinates.
+        assert_eq!(
+            plaintext_refs.keys().collect::<Vec<_>>(),
+            content_ranges.iter().collect::<Vec<_>>(),
+        );
+
+        let cipher_refs = build_cipher_refs(&mut vm, &cipher, &plaintext_refs, &records).unwrap();
+
+        // Record-ciphertext bases (inner_len = content_len + 1 + p):
+        //   R0 [0..136), R1 [136..202), R2 [202..238), R3 [238..258), R4 [258..263).
+        // Transcript (content) bases: R0 0, R1 128, R2 191, R3 224, R4 239.
+        let cipher_keys = cipher_refs.keys().collect::<Vec<_>>();
+        let expected = vec![
+            // R0 content [1..15)   -> shift +0
+            1..15,
+            // R0 content [126..128) (head of [126..130)) -> shift +0
+            126..128,
+            // R0 suffix: content_len 128, inner_len 136 -> [128..136)
+            128..136,
+            // R1 content [128..130) (tail of [126..130)) -> shift +8 -> [136..138)
+            136..138,
+            // R1 suffix: c_base 136 + content_len 63 -> [199..202)
+            199..202,
+            // R2 content [191..192) -> c_base 202 + (191-191) -> [202..203)
+            202..203,
+            // R2 suffix: c_base 202 + content_len 33 -> [235..238)
+            235..238,
+            // R3 suffix (no content revealed): c_base 238 + content_len 15 -> [253..258)
+            253..258,
+            // R4 content [239..243) -> c_base 258 + (239-239) -> [258..262)
+            258..262,
+            // R4 suffix: c_base 258 + content_len 4 -> [262..263)
+            262..263,
+        ];
+
+        assert_eq!(cipher_keys, expected);
     }
 }

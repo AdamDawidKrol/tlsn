@@ -13,7 +13,11 @@ use tlsn_core::{
 
 use crate::{
     Error, Result,
-    transcript_internal::{TranscriptRefs, auth::prove_plaintext, commit::hash::prove_hash},
+    transcript_internal::{
+        TranscriptRefs,
+        auth::{CipherParams, prove_plaintext},
+        commit::hash::prove_hash,
+    },
 };
 
 pub(crate) async fn prove<T: Vm<Binary> + Send + Sync>(
@@ -40,11 +44,16 @@ pub(crate) async fn prove<T: Vm<Binary> + Send + Sync>(
             });
     }
 
+    // TODO(item 8): V1_3 SessionKeys. `mpc_tls::SessionKeys` only exposes the
+    // 4-byte TLS 1.2 implicit IV; wiring the 12-byte 1.3 IV (and selecting
+    // `CipherParams::V1_3`) is item 8 (parent spec §8 / open-question §4).
     let transcript_refs = TranscriptRefs {
         sent: prove_plaintext(
             vm,
-            keys.client_write_key,
-            keys.client_write_iv,
+            CipherParams::V1_2 {
+                key: keys.client_write_key,
+                iv: keys.client_write_iv,
+            },
             transcript.sent(),
             tls_transcript
                 .sent()
@@ -60,8 +69,10 @@ pub(crate) async fn prove<T: Vm<Binary> + Send + Sync>(
         })?,
         recv: prove_plaintext(
             vm,
-            keys.server_write_key,
-            keys.server_write_iv,
+            CipherParams::V1_2 {
+                key: keys.server_write_key,
+                iv: keys.server_write_iv,
+            },
             transcript.received(),
             tls_transcript
                 .recv()
