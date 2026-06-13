@@ -1,4 +1,6 @@
-//! This crate contains the protocol for computing TLS 1.2 SHA-256 HMAC PRF.
+//! This crate contains protocols for computing TLS key derivation inside an
+//! MPC/ZK VM: the TLS 1.2 SHA-256 HMAC PRF ([`Prf`]) and the TLS 1.3 SHA-256
+//! key schedule ([`KeySchedule13`]).
 
 #![deny(missing_docs, unreachable_pub, unused_must_use)]
 #![deny(clippy::all)]
@@ -16,6 +18,9 @@ pub use error::PrfError;
 
 mod prf;
 pub use prf::Prf;
+
+mod key_schedule;
+pub use key_schedule::{KeySchedule13, ScheduleOutput13, SessionKeys13};
 
 use mpz_vm_core::memory::{Array, binary::U8};
 

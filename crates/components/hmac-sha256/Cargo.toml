@@ -32,6 +32,7 @@ criterion = { workspace = true, features = ["async_tokio"] }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 rand = { workspace = true }
 hex = { workspace = true }
+hmac = { workspace = true }
 ring = { workspace = true }
 
 [[bench]]

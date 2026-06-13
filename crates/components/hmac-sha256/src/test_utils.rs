@@ -83,6 +83,91 @@ pub(crate) fn phash(key: Vec<u8>, seed: &[u8], iterations: usize) -> Vec<u8> {
     output
 }
 
+/// Cleartext reference implementation of the TLS 1.3 key-schedule subgraph
+/// computed by [`KeySchedule13`](crate::KeySchedule13), built on RustCrypto
+/// `hmac`/`sha2` for independence from the hand-rolled helpers above.
+pub(crate) mod tls13 {
+    use hmac::{Hmac, Mac};
+    use sha2::{Digest, Sha256};
+
+    /// All node values of the RFC 8446 §7.1 subgraph from `handshake_secret`
+    /// down to the application traffic keys.
+    pub(crate) struct KeySchedule13Values {
+        pub(crate) c_hs: [u8; 32],
+        pub(crate) s_hs: [u8; 32],
+        pub(crate) derived: [u8; 32],
+        pub(crate) master: [u8; 32],
+        pub(crate) c_ap: [u8; 32],
+        pub(crate) s_ap: [u8; 32],
+        pub(crate) client_write_key: [u8; 16],
+        pub(crate) server_write_key: [u8; 16],
+        pub(crate) client_iv: [u8; 12],
+        pub(crate) server_iv: [u8; 12],
+    }
+
+    /// Evaluates the key schedule from `handshake_secret` and the two
+    /// transcript hashes.
+    pub(crate) fn key_schedule13(hs: [u8; 32], h2: [u8; 32], h3: [u8; 32]) -> KeySchedule13Values {
+        let empty_hash: [u8; 32] = Sha256::digest([]).into();
+
+        let c_hs = hkdf_expand_label(&hs, b"c hs traffic", &h2, 32);
+        let s_hs = hkdf_expand_label(&hs, b"s hs traffic", &h2, 32);
+        let derived = hkdf_expand_label(&hs, b"derived", &empty_hash, 32);
+
+        // MS = HKDF-Extract(salt = derived, ikm = 0^32).
+        let master = hmac(&derived, &[0_u8; 32]).to_vec();
+
+        let c_ap = hkdf_expand_label(&master, b"c ap traffic", &h3, 32);
+        let s_ap = hkdf_expand_label(&master, b"s ap traffic", &h3, 32);
+
+        let client_write_key = hkdf_expand_label(&c_ap, b"key", &[], 16);
+        let client_iv = hkdf_expand_label(&c_ap, b"iv", &[], 12);
+        let server_write_key = hkdf_expand_label(&s_ap, b"key", &[], 16);
+        let server_iv = hkdf_expand_label(&s_ap, b"iv", &[], 12);
+
+        KeySchedule13Values {
+            c_hs: c_hs.try_into().unwrap(),
+            s_hs: s_hs.try_into().unwrap(),
+            derived: derived.try_into().unwrap(),
+            master: master.try_into().unwrap(),
+            c_ap: c_ap.try_into().unwrap(),
+            s_ap: s_ap.try_into().unwrap(),
+            client_write_key: client_write_key.try_into().unwrap(),
+            server_write_key: server_write_key.try_into().unwrap(),
+            client_iv: client_iv.try_into().unwrap(),
+            server_iv: server_iv.try_into().unwrap(),
+        }
+    }
+
+    /// `HKDF-Expand-Label` (RFC 8446 §7.1) for `len <= 32`, which is a single
+    /// HMAC block: `HMAC(secret, HkdfLabel || 0x01)` truncated to `len`.
+    pub(crate) fn hkdf_expand_label(
+        secret: &[u8],
+        label: &[u8],
+        ctx: &[u8],
+        len: usize,
+    ) -> Vec<u8> {
+        assert!(len <= 32);
+
+        let mut msg = (len as u16).to_be_bytes().to_vec();
+        msg.push((b"tls13 ".len() + label.len()) as u8);
+        msg.extend_from_slice(b"tls13 ");
+        msg.extend_from_slice(label);
+        msg.push(ctx.len() as u8);
+        msg.extend_from_slice(ctx);
+        msg.push(0x01);
+
+        hmac(secret, &msg)[..len].to_vec()
+    }
+
+    fn hmac(key: &[u8], msg: &[u8]) -> [u8; 32] {
+        let mut mac =
+            <Hmac<Sha256> as Mac>::new_from_slice(key).expect("hmac accepts any key length");
+        mac.update(msg);
+        mac.finalize().into_bytes().into()
+    }
+}
+
 pub(crate) fn hmac_sha256(key: Vec<u8>, msg: &[u8]) -> [u8; 32] {
     let outer_partial = compute_outer_partial(key.clone());
     let inner_local = compute_inner_local(key, msg);

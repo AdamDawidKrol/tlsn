@@ -6187,6 +6187,7 @@ version = "0.1.0-alpha.16-pre"
 dependencies = [
  "criterion",
  "hex",
+ "hmac",
  "mpz-circuits",
  "mpz-common",
  "mpz-core",

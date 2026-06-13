@@ -402,7 +402,7 @@ fn get_server_finished_vd(
 /// * `vm` - Virtual machine.
 /// * `key` - Key to pad and xor.
 /// * `mask`- Mask used for padding.
-fn compute_partial(
+pub(crate) fn compute_partial(
     vm: &mut dyn Vm<Binary>,
     key: Vector<U8>,
     mask: [u8; 64],
@@ -436,7 +436,7 @@ fn compute_partial(
     Ok(sha)
 }
 
-fn merge_outputs(
+pub(crate) fn merge_outputs(
     vm: &mut dyn Vm<Binary>,
     inputs: Vec<Array<U8, 32>>,
     output_bytes: usize,
