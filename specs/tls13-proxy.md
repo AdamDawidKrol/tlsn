@@ -613,12 +613,19 @@ the branch reviewable and bisectable, with each commit building on its own.
    `sent_cipher_params()` / `recv_cipher_params()` / `server_write_mac_key()`
    produce the version-correct `TagKeyIv` / `CipherParams` so call sites never
    branch on the version. `mpc_tls::SessionKeys` is untouched.
-5. **Padding from servers**: v1 treats `type || padding` as a disclosed public
-   suffix per record (§7.3). Confirm no application-data leakage concern from
-   disclosing padding lengths (the verifier already sees record lengths on the
-   wire; padding disclosure reveals the true content length — this weakens the
-   padding's traffic-analysis purpose for the *verifier* only, who already
-   relays the connection in proxy mode; accepted).
+5. **Padding from servers / record classification**: v1 treats `type ||
+   padding` as a disclosed public suffix per record (§7.3). No application-data
+   leakage concern from disclosing padding lengths (the verifier already sees
+   record lengths on the wire; padding disclosure reveals the true content
+   length — this weakens the padding's traffic-analysis purpose for the
+   *verifier* only, who already relays the connection in proxy mode; accepted).
+   **RESOLVED (classification, item 8b):** the verifier ZK-proves the inner type
+   of **every** app-epoch record and classifies on the proven value — the
+   prover-sent `(inner_type, content_len)` metadata is a hint the suffix proof
+   validates, not trusted input. This prevents a prover from mislabeling an
+   `application_data` record as `handshake`/`alert` to drop it and shift
+   transcript positions. Cost: a few extra public-suffix bytes per NST
+   (negligible). See `specs/tasks/tls13-record-metadata-channel.md` §5.
 
 ## 11. Explicitly unchanged
 

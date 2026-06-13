@@ -169,30 +169,37 @@ than the hardcoded `0x17`:
   `0x16 || 0x00*` that matches its wire ciphertext; a prover that mis-declares
   the type or content boundary fails the consistency proof.
 
-## 5. Classification & soundness — DESIGN DECISION (confirm before building)
+## 5. Classification & soundness — DECISION (locked)
 
 The verifier classifies app-epoch records by inner type: `ApplicationData(0x17)`
 counts toward the transcript; `Handshake(0x16)` (NewSessionTicket, post-handshake
 KeyUpdate) and `Alert(0x15)` are excluded from the application transcript (parent
-§6.1). The open question is **how strongly the verifier must verify the declared
-type for records it then excludes**:
+§6.1).
 
-- TLSNotary guarantees *authenticity of revealed bytes*, not *completeness* — a
-  prover may always choose to reveal nothing. But record classification feeds the
-  attested transcript **length and byte positions**, so a prover that mislabels a
-  real `application_data` record as `handshake` could drop it from the transcript
-  and shift positions.
-- **Recommended approach:** run the `type || padding` suffix proof over **every**
-  app-epoch record (not only those declared `application_data`), so the verifier
-  *proves* each record's true inner type from the wire ciphertext and classifies
-  on the proven value — the prover cannot mislabel without failing the proof.
-  This extends item 7's suffix handling (currently invoked only for the
-  app-data-filtered set in `verify.rs`) to the full app-epoch record list.
-- Quantify the cost (a handful of extra public-suffix bytes per NST; NSTs are
-  few) and confirm with the item-7 author that this matches the intended trust
-  model. If maintainers accept the weaker "prover may omit" model, the simpler
-  variant (trust the declared type for excluded records, prove only app-data
-  records) is acceptable — **document the choice in parent open-question §5.**
+**Decision (locked): the verifier ZK-proves the inner type of _every_ app-epoch
+record and classifies on the proven value.** Rationale: TLSNotary guarantees
+*authenticity of revealed bytes*, not *completeness*, but record classification
+feeds the attested transcript **length and byte positions** — a prover that
+mislabels a real `application_data` record as `handshake` could drop it and shift
+positions. Proving each record's true inner type removes that lever entirely; the
+prover cannot mislabel a record without failing its suffix consistency proof.
+
+Implementation consequences:
+
+- Run the `type || padding` suffix proof over the **full** app-epoch record list
+  per direction, not only the records declared `application_data`. Item 7 invokes
+  the suffix mechanism only for the `typ == ApplicationData`-filtered set in
+  `verify.rs`; extend it so non-app-data records (NSTs, KeyUpdates, alerts) also
+  get their `inner_type || padding` suffix allocated, publicly assigned, and
+  checked against the wire ciphertext.
+- The verifier sets each record's `typ` from the **proven** suffix type byte (the
+  metadata `Tls13RecordMeta.typ` is a prover *hint* that the proof validates, not
+  trusted input). The application transcript and the app-data plaintext-proof set
+  are then derived from the proven classification.
+- Cost is a handful of extra public-suffix bytes per non-app-data record; NSTs
+  are few (typically ≤2 per session), so the overhead is negligible.
+
+This is recorded in parent open-question §5.
 
 ## 6. Tests
 
