@@ -10,7 +10,7 @@ use crate::{
     deps::{VerifierDeps, VerifierMpcDeps, VerifierProxyDeps},
     msg::{ProveRequestMsg, Response, TlsCommitRequestMsg},
     proxy::InspectReader,
-    tag::verify_tags,
+    tag::{TagKeyIv, verify_tags},
 };
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use mpz_common::Context;
@@ -254,9 +254,11 @@ impl Verifier<state::CommitAccepted<Mpc>> {
         // records.
         let tag_proof = verify_tags(
             &mut vm,
-            (keys.server_write_key, keys.server_write_iv),
+            TagKeyIv::V1_2 {
+                key: keys.server_write_key,
+                iv: keys.server_write_iv,
+            },
             keys.server_write_mac_key,
-            tls_transcript.version(),
             tls_transcript.recv().to_vec(),
         )
         .map_err(|e| {
@@ -362,9 +364,11 @@ impl Verifier<state::CommitAccepted<Proxy>> {
         // records.
         let tag_proof = verify_tags(
             &mut vm,
-            (keys.server_write_key, keys.server_write_iv),
+            TagKeyIv::V1_2 {
+                key: keys.server_write_key,
+                iv: keys.server_write_iv,
+            },
             keys.server_write_mac_key,
-            tls_transcript.version(),
             tls_transcript.recv().to_vec(),
         )
         .map_err(|e| {
