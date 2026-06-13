@@ -5886,6 +5886,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "tls13-secret-capture"
+version = "0.0.0"
+dependencies = [
+ "futures",
+ "hex",
+ "hkdf",
+ "hmac",
+ "rustls 0.23.40",
+ "sha2",
+ "tls-server-fixture",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "tlsn"
 version = "0.1.0-alpha.16-pre"
 dependencies = [

@@ -21,6 +21,7 @@ members = [
     "crates/harness/runner",
     "crates/harness/plot",
     "crates/tlsn",
+    "crates/spikes/tls13-secret-capture",
 ]
 # `crates/examples-zk` is intentionally excluded from the workspace. It pulls
 # in `noir-rs`, which transitively depends on the `noir-lang/noir` monorepo via
