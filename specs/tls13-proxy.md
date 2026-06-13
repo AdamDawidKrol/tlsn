@@ -472,7 +472,7 @@ version dispatch calling the V1_3 `HandshakeData::verify` path (§6.3).
 | 7 | Plaintext-proof suffix handling + range math | `tlsn` (`transcript_internal`) | §7.3; DONE (spec `specs/tasks/tls13-plaintext-proofs.md`; `CipherParams` enum + suffix/range math, 24 new tests). See integration notes below. |
 | 8 | Prover/verifier finalize flows, config plumbing | `tlsn` | §8; spec `specs/tasks/tls13-finalize-flows.md`; **DONE (wiring)**: `ProxyKeys` versioned key handle (`TlsOutput.keys`); dual-graph allocation (`Prf` + `KeySchedule13`) in `alloc_proxy_refs`; reordered 1.3 finalize (schedule phase-1 discloses `c_hs`/`s_hs` → build transcript → phase-2 from `h3`) on both prover & verifier; `tlsn-core` accessors `peek_tls_version_and_sh_hash` + `TlsTranscript::tls13_{sh,sf}_hash`; version-dispatched `verify_tags` / `prove`/`verify` / `HandshakeData::verify` / cf-sf checks. New hermetic unit tests; 1.2 e2e (`test_proxy`) unchanged. **Deferred to item 9**: flipping the client version list to offer 1.3 (the shared fixture auto-negotiates 1.3) and the prover→verifier per-record content-length / inner-plaintext channel — both need the 1.3-enabled fixture. |
 | 8b | TLS 1.3 record metadata channel + prover inner-plaintext recovery | `tlsn`, `tlsn-core` | §6.1/§7.3/open-q §5; spec `specs/tasks/tls13-record-metadata-channel.md`; depends on item 8 (DONE). **DONE**: `CapturedSecrets::V1_3` extended with the `CLIENT/SERVER_TRAFFIC_SECRET_0` app secrets; the builder decrypts the app-epoch records (`tls13_app_secrets`) to recover each inner plaintext and frame `Record.{typ,plaintext,content_len}` (new `Record.content_len`); the prover→verifier per-record `Tls13Metadata{sent,recv}` of `Tls13RecordMeta{typ,content_len}` is sent at finalize time over the shared proxy IO channel (`ctx.io_mut()`, between key-schedule phase 1 and phase 2) and the verifier reframes from it (`tls13_record_meta`); item 7's `alloc_suffix` generalized to the declared inner type with `RecordParams.{inner_type,is_app_data}`; locked §5 classification — `prove`/`verify` run the `type \|\| padding` suffix proof over **every** app-epoch record (`verify.rs`/`prove.rs` no longer filter to `ApplicationData` for 1.3), NSTs/KeyUpdates/alerts keep their content blind but are still suffix-proven, and `content_len()` now uses the validated per-record lengths. New hermetic unit tests (prover recovery incl. NST + padded record, `Tls13Metadata` round-trip + verifier framing match, generalized `0x16` suffix pass/fail, content_len wiring, NST excluded from the app transcript); 1.2 paths byte-for-byte (`test_proxy` unchanged). **Gated on item 9**: live 1.3 e2e exercising the channel end-to-end (needs the 1.3-enabled fixture + version flip). |
-| 9 | Fixtures + tests + bench + version flip | `server-fixture`, `harness`, `tlsn` | §9.1; spec `specs/tasks/tls13-e2e-fixture-bench.md`; depends on item 8b (DONE). **DONE (functional e2e)**: client version flip to `&[&TLS13,&TLS12]` (`prover/client/proxy/mod.rs`); version-configurable fixture `bind_with_versions` (`server-fixture`, now `with_no_client_auth` — see below); live prover↔verifier 1.3 e2e (`test_proxy_tls13`), 1.2-pinned `test_proxy`, and the negotiation matrix (`test_proxy_negotiation_matrix`) all green; webpki cert-chain happy path retired (real fixture chain verifies vs `CA_CERT_DER` in `test_proxy_tls13`/matrix) + a 1.3 wrong-root negative (`tlsn-core` `test_verify_v1_3_wrong_root`). **First live 1.3 run surfaced two cross-item integration bugs, both fixed:** (1) the shared fixture's optional client auth (`allow_unauthenticated` `WebPkiClientVerifier`) made the 1.3 server emit a `CertificateRequest`, which the item-5 builder rejects by design (§6.5) — fixed by dropping TLS-layer client auth from the fixture (no proxy/MPC test presents a client cert; rustls clients only send one on request, so 1.2/MPC/example behaviour is preserved); (2) with a default sig-alg set the RSA-cert fixture signed CertificateVerify with `rsa_pss_rsae_sha512`, which the item-5 builder rejects (§6.2 allows only the two SHA-256 schemes) — fixed by pinning the proxy client's offered signature schemes to `ecdsa_secp256r1_sha256` + `rsa_pss_rsae_sha256` (keeping `RSA_PKCS1_SHA256` in the verification-only `all` set for the cert chain). **Follow-up commit**: the harness `tls_version` selector + 1.3 bench rows and the open-question §2 dual-allocation measurement (the full harness needs Linux netns + sudo and does not run on this host; §2 resolved with a feasible preprocessing measurement — see open-question §2). |
+| 9 | Fixtures + tests + bench + version flip | `server-fixture`, `harness`, `tlsn` | §9.1; spec `specs/tasks/tls13-e2e-fixture-bench.md`; depends on item 8b (DONE). **DONE (functional e2e)**: client version flip to `&[&TLS13,&TLS12]` (`prover/client/proxy/mod.rs`); version-configurable fixture `bind_with_versions` (`server-fixture`, now `with_no_client_auth` — see below); live prover↔verifier 1.3 e2e (`test_proxy_tls13`), 1.2-pinned `test_proxy`, and the negotiation matrix (`test_proxy_negotiation_matrix`) all green; webpki cert-chain happy path retired (real fixture chain verifies vs `CA_CERT_DER` in `test_proxy_tls13`/matrix) + a 1.3 wrong-root negative (`tlsn-core` `test_verify_v1_3_wrong_root`). **First live 1.3 run surfaced two cross-item integration bugs, both fixed:** (1) the shared fixture's optional client auth (`allow_unauthenticated` `WebPkiClientVerifier`) made the 1.3 server emit a `CertificateRequest`, which the item-5 builder rejects by design (§6.5) — fixed by dropping TLS-layer client auth from the fixture (no proxy/MPC test presents a client cert; rustls clients only send one on request, so 1.2/MPC/example behaviour is preserved); (2) with a default sig-alg set the RSA-cert fixture signed CertificateVerify with `rsa_pss_rsae_sha512`, which the item-5 builder rejects (§6.2 allows only the two SHA-256 schemes) — fixed by pinning the proxy client's offered signature schemes to `ecdsa_secp256r1_sha256` + `rsa_pss_rsae_sha256` (keeping `RSA_PKCS1_SHA256` in the verification-only `all` set for the cert chain). **Open-question §2 RESOLVED (item 9)**: the dual `Prf`+`KeySchedule13` allocation is **material** — it adds ~+2.25 s (~+150%, roughly 2.5×) to a 1.2 session's preprocessing (measured on the real `mpz_zk` VOLE backend via the e2e path; VOLE correlations are generated per allocated AND-gate regardless of execution). Decision: keep always-both as the negotiation default, **recommend a session-pinned `tls_version` knob** (offer + allocate one graph) as the opt-in optimization. **Deferred**: the §4 harness `tls_version` selector + 1.3 `metrics.csv` rows and the allocation knob itself — the harness needs Linux netns + `sudo` and does not run on the dev host (would ship unvalidated), and the real per-bench saving needs the cross-party allocation knob (item-8-level). See open-question §2 for the full table + rationale. |
 
 Suggested order: 1 (DONE) → 2+4 (DONE) → 5 ∥ 3 (DONE) → 6 ∥ 7 (DONE) →
 8 (DONE) → 8b (DONE) → **9** (unblocked now).
@@ -599,13 +599,55 @@ the branch reviewable and bisectable, with each commit building on its own.
    `handshake_secret` directly and the full §5 derivation chain was validated
    in cleartext against the keylog. No fork needed. The spike also confirmed
    the §5 math and the wasm build poses no incremental risk.
-2. **Dual allocation cost** (both 1.2 and 1.3 graphs in the ZK VM): **decision
-   for v1 = always-both** (implemented in `alloc_proxy_refs`: the `Prf` and
-   `KeySchedule13` graphs are both allocated since the negotiated version is
-   unknown at preprocessing; only the negotiated one is driven at finalize, the
-   other is never flushed/executed). The actual preprocessing cost measurement
-   (always-both vs a config knob) is **pending the item-9 harness bench** — item
-   8 did not block on the §9 decision gate.
+2. **Dual allocation cost** (both 1.2 and 1.3 graphs in the ZK VM):
+   **MEASURED — the dual allocation is MATERIAL** (item 9). v1 ships
+   **always-both** (`alloc_proxy_refs` allocates `Prf` + `KeySchedule13` because
+   the negotiated version is unknown at preprocessing; only the negotiated graph
+   is driven at finalize). Earlier assumption was "unexecuted allocations are
+   ~free" — **the measurement refutes this**: the unused graph's gates are still
+   *preprocessed*.
+
+   **Measurement** (item 9, real `mpz_zk` VOLE backend over the in-memory e2e
+   duplex; `test_proxy` pinned 1.2; always-both vs a PRF-only baseline that
+   skips the 1.3 gate-producing allocations; 4 runs each, tight clustering):
+
+   | allocation        | `preprocess()` flush | host-side `alloc()` |
+   |-------------------|----------------------|---------------------|
+   | PRF-only (1.2)    | ~1.47 s              | ~1.9 ms             |
+   | always-both (v1)  | ~3.73 s              | ~7.2 ms             |
+   | **Δ (1.3 graph)** | **+~2.25 s (~+150%)**| +~5 ms              |
+
+   So the always-allocated `KeySchedule13` graph **roughly 2.5×'s the
+   preprocessing of a 1.2-only session**. Root cause: the QuickSilver/VOLE
+   prover's `vm.flush()` generates correlations **per allocated AND-gate**,
+   independent of whether those gates' inputs are ever committed or the graph is
+   ever executed online. `KeySchedule13` (~10 HMAC-SHA-256s) is comparable in
+   AND-gate count to the 1.2 PRF graph, so allocating both ≈ doubles
+   preprocessing. (Online/finalize cost is unaffected — the unused graph is never
+   driven; only preprocessing pays.) The wall-times are host-specific, but the
+   ratio is gate-count-driven and so transport-independent.
+
+   **Decision / recommendation**: keep **always-both as the default** (it is the
+   only correct choice when the client offers both versions and lets the *server*
+   negotiate — the v1 proxy model, parent §2/§8), but because the tax is now
+   quantified as material, **add a session-pinned `tls_version` knob** as the
+   opt-in optimization: `None` = negotiate ⇒ allocate both (today's default);
+   `Some(V1_2|V1_3)` = offer only that version on the client **and** allocate only
+   that graph in `alloc_proxy_refs` on **both** prover and verifier (they must
+   stay symmetric or the 2PC VMs desync). A pinned session then pays for one
+   graph only (~1.5 s instead of ~3.7 s here). This knob is the recommended
+   follow-up; it was **not** implemented in item 9 — see the harness note below.
+
+   **Harness bench (deferred)**: the §4 harness `tls_version` selector + 1.3
+   `metrics.csv` rows were **not landed**. The harness requires Linux network
+   namespaces + `sudo` (`ip netns exec`, `crates/harness/runner/src/server_fixture.rs`)
+   and does **not** run on the macOS dev host, so any harness wiring would ship
+   unvalidated; additionally, a *per-bench* version selector against the shared,
+   started-once fixture only yields the real preprocessing saving when paired with
+   the cross-party allocation knob above (a larger item-8-level change). The open
+   question is nonetheless resolved by the direct e2e measurement above, which is
+   more precise than the harness proxy would be. Landing the `tls_version` knob +
+   the harness selector + 1.3 bench rows is tracked as the recommended follow-up.
 3. **HRR**: rejected in v1. If telemetry shows meaningful failure rates with
    secp256r1-only, either enable X25519 for 1.3 (no attestation impact) or
    implement the `message_hash` transcript-reset rule in the builder.
