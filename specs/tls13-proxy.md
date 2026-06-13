@@ -476,6 +476,21 @@ version dispatch calling the V1_3 `HandshakeData::verify` path (§6.3).
 Suggested order: 1 (spike, DONE) → 2+4 (DONE) → 5 ∥ 3 (DONE) → **6 ∥ 7**
 (both unblocked now) → 8 → 9.
 
+### Commit hygiene (rule)
+
+**Commit every keypoint update.** Each completed work-item (a row in the table
+above) lands as its own atomic commit — never batch several items into one, and
+never leave a finished keypoint uncommitted. A keypoint commit bundles:
+
+- the implementation,
+- its tests,
+- the matching task spec under `specs/tasks/`,
+- and the relevant `Cargo.lock` slice (only the dependency lines that item adds).
+
+Use a Conventional-Commits message scoped to the affected crate
+(e.g. `feat(core): …`, `feat(hmac-sha256): …`, `chore(spikes): …`). This keeps
+the branch reviewable and bisectable, with each commit building on its own.
+
 ### Integration notes from items 3 & 5 (as built)
 
 - **Cipher package name is `tlsn-cipher`** (the lib is `cipher`, but `-p cipher`
