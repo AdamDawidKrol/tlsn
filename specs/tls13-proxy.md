@@ -470,7 +470,7 @@ version dispatch calling the V1_3 `HandshakeData::verify` path (§6.3).
 | 5 | Cleartext 1.3 handshake decrypt/verify, `CertBindingV1_3`, builder 1.3 path, `Record` semantics | `tlsn-core` | §6; DONE (spec `specs/tasks/tls13-core-handshake.md`; 104/104 tests). See integration notes below. |
 | 6 | `verify_tags` 1.3 branch | `tlsn` | §7.2; spec `specs/tasks/tls13-verify-tags.md`; depends on item 3 (DONE) — unblocked |
 | 7 | Plaintext-proof suffix handling + range math | `tlsn` (`transcript_internal`) | §7.3; spec `specs/tasks/tls13-plaintext-proofs.md`; depends on items 3+5 (DONE) — unblocked |
-| 8 | Prover/verifier finalize flows, config plumbing | `tlsn` | §8; depends on items 1, 5, 6 |
+| 8 | Prover/verifier finalize flows, config plumbing | `tlsn` | §8; spec `specs/tasks/tls13-finalize-flows.md`; integration step — depends on items 1, 5, 6, 7 |
 | 9 | Fixtures + tests + bench | `tls-server-fixture`, `harness`, `core` fixtures | §9.1; owns the full webpki cert-chain happy path + live 1.3 capture deferred from item 5 |
 
 Suggested order: 1 (spike, DONE) → 2+4 (DONE) → 5 ∥ 3 (DONE) → **6 ∥ 7**
