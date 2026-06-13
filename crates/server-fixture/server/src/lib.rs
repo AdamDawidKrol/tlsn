@@ -15,7 +15,10 @@ use futures::{AsyncRead, AsyncWrite, channel::oneshot};
 use futures_rustls::{
     TlsAcceptor,
     pki_types::{CertificateDer, PrivateKeyDer},
-    rustls::{RootCertStore, ServerConfig, server::WebPkiClientVerifier},
+    rustls::{
+        ServerConfig,
+        version::{TLS12, TLS13},
+    },
 };
 use hyper::{
     Request, StatusCode,
@@ -33,6 +36,10 @@ use hyper::header;
 
 use tlsn_server_fixture_certs::*;
 use tracing::info;
+
+/// Re-exported so callers can name the type accepted by [`bind_with_versions`]
+/// without depending on `futures-rustls` directly.
+pub use futures_rustls::rustls::SupportedProtocolVersion;
 
 pub const DEFAULT_FIXTURE_PORT: u16 = 3000;
 
@@ -52,23 +59,53 @@ fn app(state: AppState) -> Router {
         .with_state(Arc::new(Mutex::new(state)))
 }
 
-/// Bind the server to the given socket.
+/// TLS protocol versions the fixture server offers, in order of preference.
+///
+/// The negotiated version in proxy-mode e2e tests is driven by the *server*
+/// (the proxy client offers both 1.3 and 1.2), so pinning these is how tests
+/// keep both versions covered.
+pub const BOTH_VERSIONS: &[&SupportedProtocolVersion] = &[&TLS13, &TLS12];
+/// TLS 1.3 only — forces a 1.3 negotiation against a both-offering client.
+pub const TLS13_ONLY: &[&SupportedProtocolVersion] = &[&TLS13];
+/// TLS 1.2 only — forces a 1.2 negotiation against a both-offering client.
+pub const TLS12_ONLY: &[&SupportedProtocolVersion] = &[&TLS12];
+
+/// Bind the server to the given socket, offering **both** TLS 1.3 and 1.2.
+///
+/// Thin wrapper over [`bind_with_versions`] preserving the original behavior
+/// for non-version-sensitive callers (the negotiated version is then driven by
+/// the client's preference / the server's default).
 pub async fn bind<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
     socket: T,
+) -> anyhow::Result<()> {
+    bind_with_versions(socket, BOTH_VERSIONS).await
+}
+
+/// Bind the server to the given socket, pinning the offered TLS protocol
+/// versions.
+///
+/// Use the [`BOTH_VERSIONS`] / [`TLS13_ONLY`] / [`TLS12_ONLY`] constants (or
+/// any slice of [`futures_rustls::rustls::version`] constants) to control which
+/// version is negotiated when the proxy client offers both (parent spec §2).
+pub async fn bind_with_versions<T: AsyncRead + AsyncWrite + Send + Unpin + 'static>(
+    socket: T,
+    versions: &[&'static SupportedProtocolVersion],
 ) -> anyhow::Result<()> {
     let key = PrivateKeyDer::Pkcs8(SERVER_KEY_DER.into());
     let cert = CertificateDer::from(SERVER_CERT_DER);
 
-    // Set up a client certificate verifier.
-    let mut root_store = RootCertStore::empty();
-    root_store.add(CA_CERT_DER.into()).unwrap();
-    let client_cert_verifier = WebPkiClientVerifier::builder(root_store.into())
-        .allow_unauthenticated()
-        .build()
-        .unwrap();
-
-    let config = ServerConfig::builder()
-        .with_client_cert_verifier(client_cert_verifier)
+    // No TLS-layer client authentication. Previously this server installed an
+    // optional (`allow_unauthenticated`) `WebPkiClientVerifier`, which makes a
+    // TLS 1.3 server emit a `CertificateRequest`. tlsn proxy mode rejects
+    // `CertificateRequest` in TLS 1.3 by design (parent spec §6.5 / non-goals:
+    // in-handshake client authentication changes the Finished transcript and is
+    // out of scope for v1), so an optional-client-auth server is not a valid
+    // 1.3 target. No proxy/MPC test presents a client certificate, and rustls
+    // clients only send one in response to a `CertificateRequest`, so dropping
+    // it is behavior-preserving for the existing 1.2 callers and the MPC
+    // example (whose configured client cert simply goes unused).
+    let config = ServerConfig::builder_with_protocol_versions(versions)
+        .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .unwrap();
 

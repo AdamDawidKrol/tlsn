@@ -9,8 +9,9 @@ use crate::{
 use futures::FutureExt;
 use mpz_common::Context;
 use rustls::{
-    CipherSuite, ClientConnection, NamedGroup, RootCertStore, SupportedCipherSuite,
-    client::Resumption, crypto::CryptoProvider,
+    CipherSuite, ClientConnection, NamedGroup, RootCertStore, SignatureScheme,
+    SupportedCipherSuite, client::Resumption,
+    crypto::{CryptoProvider, WebPkiSupportedAlgorithms},
 };
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::{
@@ -34,6 +35,35 @@ const ALLOWED_SUITES: &[CipherSuite] = &[
     CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
     CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
 ];
+
+/// Signature schemes the proxy client advertises and accepts.
+///
+/// The tlsn TLS 1.3 finalize path only understands `ecdsa_secp256r1_sha256` and
+/// `rsa_pss_rsae_sha256` CertificateVerify signatures (parent spec §6.2), and
+/// the 1.2 ServerKeyExchange verification keys off the same schemes. By
+/// restricting the **offered** schemes (`mapping`) to these two, a server with
+/// an RSA certificate is forced to sign with `rsa_pss_rsae_sha256` instead of a
+/// SHA-384/512 variant the builder would reject. `all` additionally keeps
+/// `RSA_PKCS1_2048_8192_SHA256` so the *certificate chain* (which may be signed
+/// with RSA-PKCS#1-SHA256, e.g. the fixture CA) still verifies — chain
+/// verification keys off `all`, not the advertised `mapping`.
+static PROXY_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
+    all: &[
+        webpki::ring::ECDSA_P256_SHA256,
+        webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+        webpki::ring::RSA_PKCS1_2048_8192_SHA256,
+    ],
+    mapping: &[
+        (
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            &[webpki::ring::ECDSA_P256_SHA256],
+        ),
+        (
+            SignatureScheme::RSA_PSS_SHA256,
+            &[webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY],
+        ),
+    ],
+};
 
 pub(crate) struct ProxyTlsClient {
     conn: ClientConnection,
@@ -107,6 +137,7 @@ impl ProxyTlsClient {
         let provider = CryptoProvider {
             kx_groups,
             cipher_suites,
+            signature_verification_algorithms: PROXY_SIG_ALGS,
             ..provider
         };
 
@@ -327,21 +358,15 @@ fn create_client_config(
         root_store.roots.push(anchor);
     }
 
-    // The TLS 1.3 finalize flow (ProxyKeys, dual-graph ZK key schedule, record
-    // proofs) is fully wired and unit-tested, so this is intended to become
-    // `&[&rustls::version::TLS13, &rustls::version::TLS12]` (parent spec §2).
-    //
-    // It stays 1.2-only for now because the shared test fixture
-    // (`tls-server-fixture`, a default rustls server) negotiates TLS 1.3 the
-    // moment the client offers it, which would route the 1.2 e2e regression
-    // (`test_proxy`) into the 1.3 path. That path is not yet end-to-end against
-    // this fixture: the prover-side transcript build needs the per-record inner
-    // plaintext (`content || type || padding`) and the verifier needs the
-    // prover-declared content lengths — the metadata channel and a 1.3-enabled
-    // fixture are item 9 (parent spec §9, open-question §5). Flipping this list
-    // is the last, item-9-gated step to turn 1.3 on end-to-end.
+    // Offer both TLS 1.3 and 1.2, server-negotiated (parent spec §2/§8, item 9).
+    // The negotiated version is therefore driven by the server: against a
+    // 1.3-capable server rustls picks 1.3 (the capturing 1.3 suite leased above
+    // is the only 1.3 suite offered, so its secrets are always available at
+    // finalize); against a 1.2-only server it falls back to 1.2. `secp256r1`
+    // stays the only key-exchange group (parent §8), and `Resumption::disabled()`
+    // (below) keeps PSK/0-RTT off.
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_protocol_versions(&[&rustls::version::TLS12])
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
         .map_err(|e| {
             TlsnError::config()
                 .with_msg("failed to set protocol versions")

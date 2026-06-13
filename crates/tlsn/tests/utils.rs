@@ -7,7 +7,7 @@ use tlsn::{
         tls::TlsClientConfig,
         tls_commit::{mpc::MpcTlsConfig, proxy::ProxyTlsConfig},
     },
-    connection::ServerName,
+    connection::{CertBinding, ServerName, TlsVersion},
     hash::HashAlgId,
     prover::Prover,
     transcript::{Direction, Transcript, TranscriptCommitConfig, TranscriptCommitmentKind},
@@ -15,6 +15,15 @@ use tlsn::{
     webpki::{CertificateDer, RootCertStore},
 };
 use tlsn_core::{ProverOutput, VerifierOutput};
+
+/// What [`run_verifier`] observed about the negotiated session: the verifier's
+/// output, the negotiated TLS version (read from the verifier's own transcript)
+/// and the certificate binding (`V1_2` vs `V1_3`).
+pub struct VerifierObservation {
+    pub output: VerifierOutput,
+    pub version: TlsVersion,
+    pub cert_binding: CertBinding,
+}
 use tlsn_server_fixture_certs::{CA_CERT_DER, SERVER_DOMAIN};
 use tokio_util::compat::TokioAsyncReadCompatExt;
 
@@ -130,7 +139,7 @@ pub async fn finish_prover(
 pub async fn run_verifier(
     verifier: Verifier,
     server_socket: Option<tokio::io::DuplexStream>,
-) -> VerifierOutput {
+) -> VerifierObservation {
     let verifier = verifier.commit().await.unwrap();
 
     let verifier = match verifier {
@@ -147,8 +156,17 @@ pub async fn run_verifier(
         }
     };
 
+    // The verifier learns the negotiated version (and cert binding) from the
+    // wire bytes it recorded itself, before consuming the committed state.
+    let version = verifier.tls_transcript().version();
+    let cert_binding = verifier.tls_transcript().certificate_binding().clone();
+
     let (output, verifier) = verifier.verify().await.unwrap().accept().await.unwrap();
     verifier.close().await.unwrap();
 
-    output
+    VerifierObservation {
+        output,
+        version,
+        cert_binding,
+    }
 }

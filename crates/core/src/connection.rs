@@ -907,4 +907,35 @@ mod tests {
             HandshakeVerificationError::InvalidServerSignature
         ));
     }
+
+    /// A TLS 1.3 handshake with a real certificate chain that does **not** chain
+    /// to any trusted root is rejected at chain verification (parent spec §6.3
+    /// step 1). This is the cheap negative for the item-9 webpki happy path: the
+    /// chain check runs before the CertificateVerify signature check, so an
+    /// untrusted root fails first.
+    #[rstest]
+    #[case::tlsnotary(tlsnotary())]
+    #[case::appliedzkp(appliedzkp())]
+    fn test_verify_v1_3_wrong_root(#[case] mut data: ConnectionFixture) {
+        // A verifier that trusts no roots — the real fixture chain cannot be
+        // anchored.
+        let untrusted = ServerCertVerifier::new(&RootCertStore::empty()).unwrap();
+
+        data.server_cert_data.binding = CertBinding::V1_3(CertBindingV1_3 {
+            cv_transcript_hash: [0x42u8; 32],
+            sig_scheme: SignatureScheme13::RsaPssRsaeSha256,
+        });
+
+        let err = data.server_cert_data.verify(
+            &untrusted,
+            data.connection_info.time,
+            None,
+            &data.server_name,
+        );
+
+        assert!(matches!(
+            err.unwrap_err(),
+            HandshakeVerificationError::ServerCert(_)
+        ));
+    }
 }
