@@ -76,6 +76,8 @@ impl TranscriptGenerator {
             cf_hash: None,
             session_hash: None,
             sf_hash: None,
+            tls13_sh_hash: None,
+            tls13_sf_hash: None,
             sent,
             recv,
         }

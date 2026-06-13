@@ -1,4 +1,3 @@
-use mpc_tls::SessionKeys;
 use mpz_common::Context;
 use mpz_memory_core::binary::Binary;
 use mpz_vm_core::Vm;
@@ -13,17 +12,14 @@ use tlsn_core::{
 
 use crate::{
     Error, Result,
-    transcript_internal::{
-        TranscriptRefs,
-        auth::{CipherParams, prove_plaintext},
-        commit::hash::prove_hash,
-    },
+    proxy::ProxyKeys,
+    transcript_internal::{TranscriptRefs, auth::prove_plaintext, commit::hash::prove_hash},
 };
 
 pub(crate) async fn prove<T: Vm<Binary> + Send + Sync>(
     ctx: &mut Context,
     vm: &mut T,
-    keys: &SessionKeys,
+    keys: &ProxyKeys,
     transcript: &Transcript,
     tls_transcript: &TlsTranscript,
     config: &ProveConfig,
@@ -44,16 +40,12 @@ pub(crate) async fn prove<T: Vm<Binary> + Send + Sync>(
             });
     }
 
-    // TODO(item 8): V1_3 SessionKeys. `mpc_tls::SessionKeys` only exposes the
-    // 4-byte TLS 1.2 implicit IV; wiring the 12-byte 1.3 IV (and selecting
-    // `CipherParams::V1_3`) is item 8 (parent spec §8 / open-question §4).
+    // The version-correct cipher params (4-byte IV for 1.2, 12-byte for 1.3)
+    // come from `ProxyKeys`; the version dispatch lives there.
     let transcript_refs = TranscriptRefs {
         sent: prove_plaintext(
             vm,
-            CipherParams::V1_2 {
-                key: keys.client_write_key,
-                iv: keys.client_write_iv,
-            },
+            keys.sent_cipher_params(),
             transcript.sent(),
             tls_transcript
                 .sent()
@@ -69,10 +61,7 @@ pub(crate) async fn prove<T: Vm<Binary> + Send + Sync>(
         })?,
         recv: prove_plaintext(
             vm,
-            CipherParams::V1_2 {
-                key: keys.server_write_key,
-                iv: keys.server_write_iv,
-            },
+            keys.recv_cipher_params(),
             transcript.received(),
             tls_transcript
                 .recv()

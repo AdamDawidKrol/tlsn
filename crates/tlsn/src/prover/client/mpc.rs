@@ -300,8 +300,11 @@ impl TlsClient for MpcTlsClient {
                         .into_inner()
                         .into_inner();
 
+                    // MPC mode is TLS 1.2-only; wrap the `mpc_tls` keys in the
+                    // versioned proxy handle so all downstream consumers take a
+                    // single `ProxyKeys` type.
                     let output = TlsOutput {
-                        keys,
+                        keys: crate::proxy::ProxyKeys::V1_2(keys),
                         tls_transcript,
                     };
 

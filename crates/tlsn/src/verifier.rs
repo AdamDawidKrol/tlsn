@@ -9,8 +9,8 @@ use crate::{
     Error, Mpc, PROXY_STREAM_PREFIX, Proxy, Result,
     deps::{VerifierDeps, VerifierMpcDeps, VerifierProxyDeps},
     msg::{ProveRequestMsg, Response, TlsCommitRequestMsg},
-    proxy::InspectReader,
-    tag::{TagKeyIv, verify_tags},
+    proxy::{InspectReader, ProxyKeys},
+    tag::verify_tags,
 };
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use mpz_common::Context;
@@ -248,17 +248,16 @@ impl Verifier<state::CommitAccepted<Mpc>> {
             .expect("vm should have only 1 reference")
             .into_inner()
             .into_inner();
-        let keys = keys.expect("keys should be available");
+        // MPC mode is TLS 1.2-only; wrap the `mpc_tls` keys in the versioned
+        // proxy handle so `state::Committed` carries a single key type.
+        let keys = ProxyKeys::V1_2(keys.expect("keys should be available"));
 
         // Prepare for the prover to prove tag verification of the received
         // records.
         let tag_proof = verify_tags(
             &mut vm,
-            TagKeyIv::V1_2 {
-                key: keys.server_write_key,
-                iv: keys.server_write_iv,
-            },
-            keys.server_write_mac_key,
+            keys.recv_tag_key_iv(),
+            keys.server_write_mac_key(),
             tls_transcript.recv().to_vec(),
         )
         .map_err(|e| {
@@ -361,14 +360,12 @@ impl Verifier<state::CommitAccepted<Proxy>> {
         let tls_transcript = output.tls_transcript;
 
         // Prepare for the prover to prove tag verification of the received
-        // records.
+        // records. The key/IV widths and j0/AAD construction are
+        // version-dispatched by `ProxyKeys`.
         let tag_proof = verify_tags(
             &mut vm,
-            TagKeyIv::V1_2 {
-                key: keys.server_write_key,
-                iv: keys.server_write_iv,
-            },
-            keys.server_write_mac_key,
+            keys.recv_tag_key_iv(),
+            keys.server_write_mac_key(),
             tls_transcript.recv().to_vec(),
         )
         .map_err(|e| {
@@ -393,9 +390,15 @@ impl Verifier<state::CommitAccepted<Proxy>> {
         })?;
         debug!("verified tags successfully");
 
-        // Verify finished records
-        cf_vd_check.check(&mut vm)?;
-        sf_vd_check.check(&mut vm)?;
+        // Verify finished records. TLS 1.3 has no cf/sf Finished records (the
+        // server Finished is bound via the key schedule instead), so the checks
+        // are `None` and skipped (parent spec §7).
+        if let Some(cf_vd_check) = cf_vd_check {
+            cf_vd_check.check(&mut vm)?;
+        }
+        if let Some(sf_vd_check) = sf_vd_check {
+            sf_vd_check.check(&mut vm)?;
+        }
         debug!("verified finished records successfully");
 
         Ok(Verifier {

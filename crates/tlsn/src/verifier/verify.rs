@@ -1,4 +1,3 @@
-use mpc_tls::SessionKeys;
 use mpz_common::Context;
 use mpz_memory_core::binary::Binary;
 use mpz_vm_core::Vm;
@@ -6,7 +5,7 @@ use rangeset::set::RangeSet;
 use tlsn_core::{
     VerifierOutput,
     config::prove::ProveRequest,
-    connection::{HandshakeData, ServerName},
+    connection::{CertBinding, HandshakeData, ServerEphemKey, ServerName},
     transcript::{
         ContentType, Direction, PartialTranscript, Record, TlsTranscript, TranscriptCommitment,
     },
@@ -15,18 +14,15 @@ use tlsn_core::{
 
 use crate::{
     Error, Result,
-    transcript_internal::{
-        TranscriptRefs,
-        auth::{CipherParams, verify_plaintext},
-        commit::hash::verify_hash,
-    },
+    proxy::ProxyKeys,
+    transcript_internal::{TranscriptRefs, auth::verify_plaintext, commit::hash::verify_hash},
 };
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
     ctx: &mut Context,
     vm: &mut T,
-    keys: &SessionKeys,
+    keys: &ProxyKeys,
     cert_verifier: &ServerCertVerifier,
     tls_transcript: &TlsTranscript,
     request: ProveRequest,
@@ -77,18 +73,21 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
     };
 
     let server_name = if let Some((name, cert_data)) = handshake {
-        let tlsn_core::connection::CertBinding::V1_2(binding) =
-            tls_transcript.certificate_binding()
-        else {
-            return Err(
-                Error::internal().with_msg("verification failed: unsupported cert binding version")
-            );
-        };
+        // The ephemeral key is part of the TLS 1.2 cert binding (signed key
+        // exchange); in TLS 1.3 the server signs the handshake transcript hash
+        // and there is no separate ephemeral key to bind (`None`).
+        let server_ephemeral_key: Option<&ServerEphemKey> =
+            match tls_transcript.certificate_binding() {
+                CertBinding::V1_2(binding) => Some(&binding.server_ephemeral_key),
+                // TLS 1.3 (and any future binding) signs the handshake
+                // transcript hash; there is no separate ephemeral key to bind.
+                _ => None,
+            };
         cert_data
             .verify(
                 cert_verifier,
                 tls_transcript.time(),
-                &binding.server_ephemeral_key,
+                server_ephemeral_key,
                 &name,
             )
             .map_err(|e| {
@@ -112,15 +111,11 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
             });
     }
 
-    // TODO(item 8): V1_3 SessionKeys. `mpc_tls::SessionKeys` only exposes the
-    // 4-byte TLS 1.2 implicit IV; wiring the 12-byte 1.3 IV (and selecting
-    // `CipherParams::V1_3`) is item 8 (parent spec §8 / open-question §4).
+    // The version-correct cipher params (4-byte IV for 1.2, 12-byte for 1.3)
+    // come from `ProxyKeys`; the version dispatch lives there.
     let (sent_refs, sent_proof) = verify_plaintext(
         vm,
-        CipherParams::V1_2 {
-            key: keys.client_write_key,
-            iv: keys.client_write_iv,
-        },
+        keys.sent_cipher_params(),
         transcript.sent_unsafe(),
         &ciphertext_sent,
         tls_transcript
@@ -137,10 +132,7 @@ pub(crate) async fn verify<T: Vm<Binary> + Send + Sync>(
     })?;
     let (recv_refs, recv_proof) = verify_plaintext(
         vm,
-        CipherParams::V1_2 {
-            key: keys.server_write_key,
-            iv: keys.server_write_iv,
-        },
+        keys.recv_cipher_params(),
         transcript.received_unsafe(),
         &ciphertext_recv,
         tls_transcript
@@ -228,12 +220,12 @@ fn collect_ciphertext<'a>(records: impl IntoIterator<Item = &'a Record>) -> Vec<
 ///
 /// * TLS 1.2: there is no inner `type || padding`, so `content_len ==
 ///   ciphertext.len()` per record and this equals the wire ciphertext length.
-/// * TLS 1.3 (TODO item 8): `content_len = inner_len - 1 - padding`, learned
+/// * TLS 1.3 (TODO item 9): `content_len = inner_len - 1 - padding`, learned
 ///   from the per-record `type || padding` suffix proof in
-///   `transcript_internal::auth` (§2.4). That per-record content length must be
-///   threaded in once the 1.3 finalize flow is wired; until then this matches
-///   the TLS 1.2 wire length, which is correct for the only path the call sites
-///   currently take (`CipherParams::V1_2`).
+///   `transcript_internal::auth` (§2.4). The verifier needs the prover-declared
+///   per-record content length to compute this; that metadata channel is the
+///   item-9 fixture work (open-question §5). Until then this returns the wire
+///   length, which is exact for TLS 1.2 and an over-estimate for TLS 1.3.
 fn content_len<'a>(records: impl IntoIterator<Item = &'a Record>) -> usize {
     records
         .into_iter()

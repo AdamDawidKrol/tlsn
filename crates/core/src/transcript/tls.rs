@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 
 mod builder;
 mod tls13;
-pub use builder::TlsTranscriptBuilder;
+pub use builder::{TlsTranscriptBuilder, peek_tls_version_and_sh_hash};
 
 /// A transcript of TLS records sent and received by the prover.
 ///
@@ -34,6 +34,12 @@ pub struct TlsTranscript {
     pub(crate) cf_hash: Option<[u8; 32]>,
     pub(crate) session_hash: Option<[u8; 32]>,
     pub(crate) sf_hash: Option<SfHashInput>,
+    /// TLS 1.3 only: `h2 = H(ClientHello..ServerHello)`, the `set_sh_hash`
+    /// input of the ZK key schedule (parent spec §5). `None` for TLS 1.2.
+    pub(crate) tls13_sh_hash: Option<[u8; 32]>,
+    /// TLS 1.3 only: `h3 = H(ClientHello..server Finished)`, the `set_sf_hash`
+    /// input of the ZK key schedule (parent spec §5). `None` for TLS 1.2.
+    pub(crate) tls13_sf_hash: Option<[u8; 32]>,
 }
 
 impl TlsTranscript {
@@ -175,6 +181,24 @@ impl TlsTranscript {
 
         let sf_hash = hasher.finalize().into();
         Some(sf_hash)
+    }
+
+    /// Returns the TLS 1.3 ServerHello transcript hash
+    /// `h2 = H(ClientHello..ServerHello)`.
+    ///
+    /// **TLS 1.3 only** (`set_sh_hash` input of the ZK key schedule, parent
+    /// spec §5); `None` for TLS 1.2.
+    pub fn tls13_sh_hash(&self) -> Option<[u8; 32]> {
+        self.tls13_sh_hash
+    }
+
+    /// Returns the TLS 1.3 server-Finished transcript hash
+    /// `h3 = H(ClientHello..server Finished)`.
+    ///
+    /// **TLS 1.3 only** (`set_sf_hash` input of the ZK key schedule, parent
+    /// spec §5); `None` for TLS 1.2.
+    pub fn tls13_sf_hash(&self) -> Option<[u8; 32]> {
+        self.tls13_sf_hash
     }
 
     /// Returns the application data transcript.

@@ -1,18 +1,35 @@
 use crate::{
     Error as TlsnError, TlsOutput,
     deps::VerifierZk,
-    proxy::{MsVisibility, References, VerifyDataCheck, alloc_proxy_refs},
+    proxy::{MsVisibility, ProxyKeys, References, VerifyDataCheck, alloc_proxy_refs},
 };
-use hmac_sha256::Prf;
+use hmac_sha256::{KeySchedule13, Prf};
 use mpz_common::Context;
 use mpz_memory_core::MemoryExt;
 use mpz_vm_core::Execute;
-use tlsn_core::transcript::TlsTranscript;
+use tlsn_core::{
+    connection::TlsVersion,
+    transcript::{TlsTranscript, peek_tls_version_and_sh_hash},
+};
+
+/// The verifier's finalize output. The two verify-data checks are `Some` only
+/// for TLS 1.2 (the cf/sf Finished records); TLS 1.3 has no such records and
+/// returns `None` for both (parent spec §7).
+type FinalizeOutput = (
+    Context,
+    VerifierZk,
+    TlsOutput,
+    Option<VerifyDataCheck>,
+    Option<VerifyDataCheck>,
+);
 
 pub(crate) struct ProxyVerifier {
     ctx: Context,
     vm: VerifierZk,
     prf: Prf,
+    /// TLS 1.3 ZK key schedule, allocated alongside `prf` (dual-graph
+    /// allocation, parent spec §8); only one is driven at finalization.
+    ks13: KeySchedule13,
     refs: Option<References>,
     cf_vd_check: VerifyDataCheck,
     sf_vd_check: VerifyDataCheck,
@@ -24,6 +41,7 @@ impl ProxyVerifier {
             ctx,
             vm,
             prf,
+            ks13: KeySchedule13::new(),
             refs: None,
             cf_vd_check: VerifyDataCheck::default(),
             sf_vd_check: VerifyDataCheck::default(),
@@ -34,6 +52,7 @@ impl ProxyVerifier {
         self.refs = Some(alloc_proxy_refs(
             &mut self.vm,
             &mut self.prf,
+            &mut self.ks13,
             &mut self.cf_vd_check,
             &mut self.sf_vd_check,
             MsVisibility::Blind,
@@ -50,20 +69,33 @@ impl ProxyVerifier {
     }
 
     pub(crate) async fn finalize(
+        self,
+        sent: &[u8],
+        recv: &[u8],
+        conn_time: u64,
+    ) -> Result<FinalizeOutput, TlsnError> {
+        // The verifier has no rustls connection, so it learns the negotiated
+        // version (and `h2`) from the plaintext wire records.
+        let (version, h2) = peek_tls_version_and_sh_hash(sent, recv).map_err(|e| {
+            TlsnError::internal()
+                .with_msg("verifier could not peek tls version")
+                .with_source(e)
+        })?;
+
+        match version {
+            TlsVersion::V1_2 => self.finalize_v1_2(sent, recv, conn_time).await,
+            TlsVersion::V1_3 => self.finalize_v1_3(sent, recv, conn_time, h2).await,
+        }
+    }
+
+    /// TLS 1.2 finalize flow. Byte-for-byte the original proxy-mode verifier
+    /// flow; returns `Some` cf/sf checks.
+    async fn finalize_v1_2(
         mut self,
         sent: &[u8],
         recv: &[u8],
         conn_time: u64,
-    ) -> Result<
-        (
-            Context,
-            VerifierZk,
-            TlsOutput,
-            VerifyDataCheck,
-            VerifyDataCheck,
-        ),
-        TlsnError,
-    > {
+    ) -> Result<FinalizeOutput, TlsnError> {
         let tls_transcript = TlsTranscript::builder()
             .time(conn_time)
             .tls_sent(sent)
@@ -160,7 +192,7 @@ impl ProxyVerifier {
 
         tracing::info!("Proxy-TLS done");
         let output = TlsOutput {
-            keys: refs.keys,
+            keys: ProxyKeys::V1_2(refs.keys),
             tls_transcript,
         };
 
@@ -168,8 +200,101 @@ impl ProxyVerifier {
             self.ctx,
             self.vm,
             output,
-            self.cf_vd_check,
-            self.sf_vd_check,
+            Some(self.cf_vd_check),
+            Some(self.sf_vd_check),
         ))
+    }
+
+    /// TLS 1.3 finalize flow (parent spec §7/§8): the verifier mirrors the
+    /// prover but leaves `hs` blind and *learns* `c_hs`/`s_hs` from the public
+    /// decode. There are no Finished records to check, so both verify-data
+    /// checks are `None`.
+    async fn finalize_v1_3(
+        mut self,
+        sent: &[u8],
+        recv: &[u8],
+        conn_time: u64,
+        h2: [u8; 32],
+    ) -> Result<FinalizeOutput, TlsnError> {
+        let mut refs = self.refs.expect("key refs should be available");
+
+        // The blind handshake secret is committed but never assigned by the
+        // verifier (the prover provides it privately).
+        tracing::debug!("driving TLS 1.3 key schedule (phase 1)...");
+        self.vm
+            .commit(refs.hs)
+            .map_err(|e| TlsnError::internal().with_source(e))?;
+
+        // Phase 1: `h2` unblocks the disclosed `c_hs`/`s_hs`.
+        self.ks13
+            .set_sh_hash(h2)
+            .map_err(|e| TlsnError::internal().with_source(e))?;
+        while self.ks13.wants_flush() {
+            self.ks13
+                .flush(&mut self.vm)
+                .map_err(|e| TlsnError::internal().with_source(e))?;
+            self.vm
+                .execute_all(&mut self.ctx)
+                .await
+                .map_err(|e| TlsnError::internal().with_source(e))?;
+        }
+
+        let c_hs = refs
+            .c_hs
+            .try_recv()
+            .map_err(|e| TlsnError::internal().with_source(e))?
+            .ok_or(TlsnError::internal().with_msg("unable to receive c_hs from decoding"))?;
+        let s_hs = refs
+            .s_hs
+            .try_recv()
+            .map_err(|e| TlsnError::internal().with_source(e))?
+            .ok_or(TlsnError::internal().with_msg("unable to receive s_hs from decoding"))?;
+
+        // Build the transcript, decrypting the handshake flight with the
+        // learned secrets. This also computes `h3`.
+        let tls_transcript = TlsTranscript::builder()
+            .time(conn_time)
+            .tls_sent(sent)
+            .tls_recv(recv)
+            .handshake_secrets(c_hs, s_hs)
+            .build()
+            .map_err(|e| {
+                TlsnError::internal()
+                    .with_msg("verifier could not build tls 1.3 transcript")
+                    .with_source(e)
+            })?;
+        tracing::debug!("successfully parsed tls 1.3 transcript");
+
+        let h3 = tls_transcript
+            .tls13_sf_hash()
+            .ok_or(TlsnError::internal().with_msg("tls 1.3 sf hash should be available"))?;
+
+        tracing::debug!("driving TLS 1.3 key schedule (phase 2)...");
+        self.ks13
+            .set_sf_hash(h3)
+            .map_err(|e| TlsnError::internal().with_source(e))?;
+        while self.ks13.wants_flush() {
+            self.ks13
+                .flush(&mut self.vm)
+                .map_err(|e| TlsnError::internal().with_source(e))?;
+            self.vm
+                .execute_all(&mut self.ctx)
+                .await
+                .map_err(|e| TlsnError::internal().with_source(e))?;
+        }
+
+        tracing::info!("Proxy-TLS 1.3 done");
+        let output = TlsOutput {
+            keys: ProxyKeys::V1_3 {
+                client_write_key: refs.keys13.client_write_key,
+                client_write_iv: refs.keys13.client_iv,
+                server_write_key: refs.keys13.server_write_key,
+                server_write_iv: refs.keys13.server_iv,
+                server_write_mac_key: refs.server_write_mac_key13,
+            },
+            tls_transcript,
+        };
+
+        Ok((self.ctx, self.vm, output, None, None))
     }
 }

@@ -21,7 +21,7 @@ use crate::{
         future::FutureState,
         state::ConnectedProj,
     },
-    tag::{TagKeyIv, verify_tags},
+    tag::verify_tags,
 };
 
 use futures::{AsyncRead, AsyncWrite, ready};
@@ -350,14 +350,12 @@ where
             .ok_or(Error::internal().with_msg("prover has not yet closed the connection"))?;
 
         // Prove tag verification of received records.
-        // The prover drops the proof output.
+        // The prover drops the proof output. The key/IV widths and j0/AAD
+        // construction are version-dispatched by `ProxyKeys`.
         let _ = verify_tags(
             &mut vm,
-            TagKeyIv::V1_2 {
-                key: keys.server_write_key,
-                iv: keys.server_write_iv,
-            },
-            keys.server_write_mac_key,
+            keys.recv_tag_key_iv(),
+            keys.server_write_mac_key(),
             tls_transcript.recv().to_vec(),
         )
         .map_err(|err| {

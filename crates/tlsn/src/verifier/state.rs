@@ -2,7 +2,6 @@
 
 use std::marker::PhantomData;
 
-use mpc_tls::SessionKeys;
 use tlsn_core::{
     config::prove::ProveRequest,
     connection::{HandshakeData, ServerName},
@@ -11,7 +10,10 @@ use tlsn_core::{
 
 use tlsn_core::config::tls_commit::TlsCommitConfig;
 
-use crate::deps::{VerifierDeps, VerifierZk};
+use crate::{
+    deps::{VerifierDeps, VerifierZk},
+    proxy::ProxyKeys,
+};
 
 /// TLS Verifier state.
 pub trait VerifierState: sealed::Sealed {}
@@ -49,7 +51,7 @@ impl<C> std::fmt::Debug for CommitAccepted<C> {
 /// State after the TLS transcript has been committed.
 pub struct Committed {
     pub(crate) vm: VerifierZk,
-    pub(crate) keys: SessionKeys,
+    pub(crate) keys: ProxyKeys,
     pub(crate) tls_transcript: TlsTranscript,
 }
 
@@ -58,7 +60,7 @@ opaque_debug::implement!(Committed);
 /// State after receiving a proving request.
 pub struct Verify {
     pub(crate) vm: VerifierZk,
-    pub(crate) keys: SessionKeys,
+    pub(crate) keys: ProxyKeys,
     pub(crate) tls_transcript: TlsTranscript,
     pub(crate) request: ProveRequest,
     pub(crate) handshake: Option<(ServerName, HandshakeData)>,

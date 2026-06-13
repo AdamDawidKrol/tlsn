@@ -93,10 +93,14 @@ impl ProxyTlsClient {
             .copied()
             .collect();
 
-        // Lease the secret-capturing TLS 1.3 suite and wire it into the
-        // provider so TLS 1.3 secret capture is ready. This is harmless while
-        // the protocol version list stays 1.2-only (see `create_client_config`):
-        // rustls will not offer the 1.3 suite, so real sessions stay on 1.2.
+        // Lease the secret-capturing TLS 1.3 suite (a `TLS13_AES_128_GCM_SHA256`
+        // variant that records the HKDF-derived handshake secret) and wire it
+        // in. The suite filter above keeps the 1.2 suites and drops the default
+        // 1.3 suite, so once the protocol version list offers TLS 1.3 (see
+        // `create_client_config`) this capturing suite is the *only* 1.3 suite
+        // offered and a negotiated 1.3 session always has its secrets available
+        // at finalize (parent spec §2/§4). It is harmless while the version list
+        // stays 1.2-only: rustls will not offer any 1.3 suite.
         let capture_lease = CapturePool::lease();
         cipher_suites.push(capture_lease.suite());
 
@@ -323,6 +327,19 @@ fn create_client_config(
         root_store.roots.push(anchor);
     }
 
+    // The TLS 1.3 finalize flow (ProxyKeys, dual-graph ZK key schedule, record
+    // proofs) is fully wired and unit-tested, so this is intended to become
+    // `&[&rustls::version::TLS13, &rustls::version::TLS12]` (parent spec §2).
+    //
+    // It stays 1.2-only for now because the shared test fixture
+    // (`tls-server-fixture`, a default rustls server) negotiates TLS 1.3 the
+    // moment the client offers it, which would route the 1.2 e2e regression
+    // (`test_proxy`) into the 1.3 path. That path is not yet end-to-end against
+    // this fixture: the prover-side transcript build needs the per-record inner
+    // plaintext (`content || type || padding`) and the verifier needs the
+    // prover-declared content lengths — the metadata channel and a 1.3-enabled
+    // fixture are item 9 (parent spec §9, open-question §5). Flipping this list
+    // is the last, item-9-gated step to turn 1.3 on end-to-end.
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
         .with_protocol_versions(&[&rustls::version::TLS12])
         .map_err(|e| {

@@ -92,7 +92,7 @@ pub use tlsn_mux::Stream;
 /// Result type.
 pub type Result<T, E = Error> = core::result::Result<T, E>;
 
-use mpc_tls::SessionKeys;
+use crate::proxy::ProxyKeys;
 use semver::Version;
 use std::sync::LazyLock;
 use tlsn_core::{
@@ -121,7 +121,7 @@ pub(crate) enum Role {
 
 /// Output of a TLS session.
 pub(crate) struct TlsOutput {
-    pub(crate) keys: SessionKeys,
+    pub(crate) keys: ProxyKeys,
     pub(crate) tls_transcript: TlsTranscript,
 }
 

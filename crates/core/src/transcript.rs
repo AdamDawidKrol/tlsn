@@ -41,7 +41,10 @@ pub use commit::{
 pub use proof::{
     TranscriptProof, TranscriptProofBuilder, TranscriptProofBuilderError, TranscriptProofError,
 };
-pub use tls::{ContentType, Record, TlsTranscript, TlsTranscriptBuilder, TlsTranscriptError};
+pub use tls::{
+    ContentType, Record, TlsTranscript, TlsTranscriptBuilder, TlsTranscriptError,
+    peek_tls_version_and_sh_hash,
+};
 
 /// A transcript contains the plaintext of all application data communicated
 /// between the Prover and the Server.

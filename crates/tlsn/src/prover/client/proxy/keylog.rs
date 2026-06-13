@@ -23,10 +23,9 @@ pub(crate) enum CapturedSecrets {
     /// TLS 1.3: the `handshake_secret` (recovered via the capturing HKDF
     /// provider) plus the two handshake traffic secrets (from the `KeyLog`).
     ///
-    /// These fields are captured here but only consumed by the TLS 1.3 finalize
-    /// flow (work-breakdown item 8, `specs/tls13-proxy.md` §8) and the capture
-    /// test; the production client negotiates only TLS 1.2 today.
-    #[allow(dead_code)]
+    /// Consumed by the TLS 1.3 finalize flow (`specs/tls13-proxy.md` §8): the
+    /// `handshake_secret` is the private input to the ZK key schedule and the
+    /// two traffic secrets are asserted against its publicly-decoded outputs.
     V1_3 {
         handshake_secret: [u8; 32],
         client_hs_traffic_secret: [u8; 32],

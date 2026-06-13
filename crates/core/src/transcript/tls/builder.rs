@@ -223,6 +223,8 @@ impl<'a> TlsTranscriptBuilder<'a> {
             cf_hash,
             session_hash,
             sf_hash,
+            tls13_sh_hash: None,
+            tls13_sf_hash: None,
             sent,
             recv,
         };
@@ -232,9 +234,10 @@ impl<'a> TlsTranscriptBuilder<'a> {
 
     /// Builds a TLS 1.3 [`TlsTranscript`].
     ///
-    /// With `tls_sent`/`tls_recv` and [`handshake_secrets`](Self::handshake_secrets)
-    /// available, decrypts and verifies the handshake flight in the clear
-    /// (cert chain extraction, CertificateVerify and both Finished checks),
+    /// With `tls_sent`/`tls_recv` and
+    /// [`handshake_secrets`](Self::handshake_secrets) available, decrypts
+    /// and verifies the handshake flight in the clear (cert chain
+    /// extraction, CertificateVerify and both Finished checks),
     /// derives [`CertBinding::V1_3`], and frames the application-epoch records.
     /// Otherwise it falls back to pre-supplied records + binding.
     fn build_v1_3(
@@ -245,10 +248,16 @@ impl<'a> TlsTranscriptBuilder<'a> {
     ) -> Result<TlsTranscript, TlsTranscriptError> {
         self.version = Some(TlsVersion::V1_3);
 
+        let mut tls13_sh_hash = None;
+        let mut tls13_sf_hash = None;
         let (sent, recv) = if let (Some(sent_raw), Some(recv_raw), Some((c_hs, s_hs))) =
             (&sent_raw, &recv_raw, self.handshake_secrets)
         {
             let out = self.parse_handshake_components_v1_3(sent_raw, recv_raw, &c_hs, &s_hs)?;
+            // `h2`/`h3` feed the ZK key schedule's `set_sh_hash`/`set_sf_hash`
+            // in the proxy finalize flow (parent spec §5/§8).
+            tls13_sh_hash = Some(out.h2);
+            tls13_sf_hash = Some(out.h3);
 
             let sent = if let Some(records_sent) = self.records_sent.take() {
                 records_sent
@@ -296,6 +305,8 @@ impl<'a> TlsTranscriptBuilder<'a> {
             cf_hash: None,
             session_hash: None,
             sf_hash: None,
+            tls13_sh_hash,
+            tls13_sf_hash,
             sent,
             recv,
         })
@@ -359,9 +370,10 @@ impl<'a> TlsTranscriptBuilder<'a> {
         }
 
         // 2. Decrypt the server handshake-epoch records with `s_hs` and
-        // reassemble the EncryptedExtensions..Finished message stream. (h2 =
-        // H(CH..SH) is not needed here; it is computed by the caller for the
-        // ZK key schedule, parent spec §8.)
+        // reassemble the EncryptedExtensions..Finished message stream. `h2 =
+        // H(CH..SH)` is the `set_sh_hash` input of the ZK key schedule (parent
+        // spec §5/§8); it is returned for the finalize flow.
+        let h2 = sha256_concat(&[&ch_bytes, &sh_bytes]);
         let (s_key, s_iv) = traffic_keys(s_hs);
         let mut server_stream = Vec::new();
         let mut server_seq = 0u64;
@@ -550,6 +562,8 @@ impl<'a> TlsTranscriptBuilder<'a> {
         Ok(Handshake13Output {
             sent_app_start,
             recv_app_start,
+            h2,
+            h3,
         })
     }
 
@@ -595,10 +609,15 @@ pub(crate) struct SfHashInput {
 }
 
 /// Where the application epoch begins in each direction after the TLS 1.3
-/// handshake-epoch records have been consumed.
+/// handshake-epoch records have been consumed, plus the key-schedule transcript
+/// hashes derived from the cleartext handshake.
 struct Handshake13Output {
     sent_app_start: usize,
     recv_app_start: usize,
+    /// `h2 = H(ClientHello..ServerHello)` — the `set_sh_hash` input.
+    h2: [u8; 32],
+    /// `h3 = H(ClientHello..server Finished)` — the `set_sf_hash` input.
+    h3: [u8; 32],
 }
 
 const NONCE_LEN: usize = 8;
@@ -1060,6 +1079,46 @@ fn parse_records(
     Ok(parsed)
 }
 
+/// Peeks the negotiated TLS version and the TLS 1.3 ServerHello transcript
+/// hash `h2 = H(ClientHello..ServerHello)` from the **plaintext** wire records,
+/// without needing the handshake secrets.
+///
+/// This is the pre-parse the proxy finalize flow runs before building the full
+/// transcript: the ZK key schedule must disclose `c_hs`/`s_hs` (which need
+/// `h2`) before the handshake flight can be decrypted (parent spec §5/§8). The
+/// verifier — which has no rustls connection — relies on this for both the
+/// version and `h2`; the prover may instead take the version from
+/// `conn.protocol_version()` and use this only for `h2`.
+///
+/// `h2` is the SHA-256 over the leading run of plaintext handshake records in
+/// each direction (the ClientHello and the ServerHello). For a TLS 1.2
+/// connection the returned hash is not meaningful (the recv leading run spans
+/// ServerHello..ServerHelloDone); callers dispatch on the returned version and
+/// only consume `h2` for TLS 1.3.
+pub fn peek_tls_version_and_sh_hash(
+    tls_sent: &[u8],
+    tls_recv: &[u8],
+) -> Result<(TlsVersion, [u8; 32]), TlsTranscriptError> {
+    let sent_raw = parse_raw_records(tls_sent)?;
+    let recv_raw = parse_raw_records(tls_recv)?;
+
+    let version = detect_tls_version(&recv_raw)?
+        .ok_or_else(|| TlsTranscriptError::parse("missing plaintext ServerHello"))?;
+
+    let (ch_bytes, _) = leading_handshake_bytes(&sent_raw);
+    let (sh_bytes, _) = leading_handshake_bytes(&recv_raw);
+    if ch_bytes.is_empty() {
+        return Err(TlsTranscriptError::parse("missing plaintext ClientHello"));
+    }
+    if sh_bytes.is_empty() {
+        return Err(TlsTranscriptError::parse("missing plaintext ServerHello"));
+    }
+
+    let h2 = sha256_concat(&[&ch_bytes, &sh_bytes]);
+
+    Ok((version, h2))
+}
+
 /// Detects the negotiated TLS version from the ServerHello.
 ///
 /// Keys off the `supported_versions` extension (the `legacy_version` field is
@@ -1450,6 +1509,21 @@ mod tests {
         // Version detected from ServerHello supported_versions.
         assert_eq!(transcript.version(), TlsVersion::V1_3);
 
+        // The 1.3-only key-schedule transcript hashes are populated: `h2`
+        // (set_sh_hash input) is the published RFC 8448 value, and `h3`
+        // (set_sf_hash input, the `c ap traffic` derive hash) matches too.
+        // These are `None` for TLS 1.2 (asserted in `test_parse_into_transcript`
+        // implicitly: the 1.2 path leaves them unset).
+        const RFC8448_H3: &str = "9608102a0f1ccc6db6250b7b7e417b1a000eaada3daae4777a7686c9ff83df13";
+        assert_eq!(
+            transcript.tls13_sh_hash(),
+            Some(rfc8448::hex_arr::<32>(rfc8448::H2))
+        );
+        assert_eq!(
+            transcript.tls13_sf_hash(),
+            Some(rfc8448::hex_arr::<32>(RFC8448_H3))
+        );
+
         // The certificate chain was extracted from the decrypted flight.
         let certs = transcript.server_cert_chain().expect("cert chain parsed");
         assert_eq!(certs.len(), 1);
@@ -1482,6 +1556,26 @@ mod tests {
         let expected_sent: Vec<u8> = (0u8..=0x31).collect();
         assert_eq!(app.sent(), expected_sent.as_slice());
         assert!(app.received().is_empty());
+    }
+
+    #[test]
+    fn test_peek_tls_version_and_sh_hash_tls13() {
+        let w = rfc8448_wire();
+
+        // The pre-parse learns the negotiated version and `h2` from the
+        // plaintext wire records alone (no handshake secrets needed) — the
+        // verifier's entry point into the 1.3 finalize flow (parent spec §5/§8).
+        let (version, h2) = peek_tls_version_and_sh_hash(&w.tls_sent, &w.tls_recv).unwrap();
+        assert_eq!(version, TlsVersion::V1_3);
+        assert_eq!(h2, rfc8448::hex_arr::<32>(rfc8448::H2));
+    }
+
+    #[test]
+    fn test_peek_tls_version_and_sh_hash_tls12() {
+        // The pre-parse reports the TLS 1.2 version from a real 1.2 transcript;
+        // the returned hash is not consumed for 1.2 (only the version is).
+        let (version, _h2) = peek_tls_version_and_sh_hash(SENT, RECV).unwrap();
+        assert_eq!(version, TlsVersion::V1_2);
     }
 
     #[test]

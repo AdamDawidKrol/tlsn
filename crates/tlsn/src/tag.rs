@@ -31,9 +31,6 @@ pub(crate) enum TagKeyIv {
     },
     /// TLS 1.3: 12-byte write IV. The per-record nonce is the IV XORed with the
     /// sequence-number pad (RFC 8446 §5.3); there is no explicit nonce.
-    // Production callers are wired to this variant in item 8 (finalize-flow /
-    // `SessionKeys` widening); until then it is exercised only by tests.
-    #[allow(dead_code)]
     V1_3 {
         /// AES-128 key.
         key: Array<U8, 16>,

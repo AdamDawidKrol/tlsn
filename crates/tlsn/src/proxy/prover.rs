@@ -2,19 +2,22 @@ use crate::{
     Error as TlsnError, TlsOutput,
     deps::ProverZk,
     prover::client::proxy::keylog::CapturedSecrets,
-    proxy::{MsVisibility, References, TlsBytes, VerifyDataCheck, alloc_proxy_refs},
+    proxy::{MsVisibility, ProxyKeys, References, TlsBytes, VerifyDataCheck, alloc_proxy_refs},
 };
-use hmac_sha256::{MSMode, NetworkMode, Prf, PrfConfig};
+use hmac_sha256::{KeySchedule13, MSMode, NetworkMode, Prf, PrfConfig};
 use mpz_common::Context;
 use mpz_memory_core::MemoryExt;
 use mpz_vm_core::Execute;
-use tlsn_core::transcript::TlsTranscript;
+use tlsn_core::transcript::{TlsTranscript, peek_tls_version_and_sh_hash};
 
 #[derive(Debug)]
 pub(crate) struct ProxyProver {
     ctx: Context,
     vm: ProverZk,
     prf: Prf,
+    /// TLS 1.3 ZK key schedule, allocated alongside `prf` (dual-graph
+    /// allocation, parent spec §8); only one is driven at finalization.
+    ks13: KeySchedule13,
     refs: Option<References>,
     cf_vd_check: VerifyDataCheck,
     sf_vd_check: VerifyDataCheck,
@@ -29,6 +32,7 @@ impl ProxyProver {
             ctx,
             vm,
             prf,
+            ks13: KeySchedule13::new(),
             refs: None,
             cf_vd_check: VerifyDataCheck::default(),
             sf_vd_check: VerifyDataCheck::default(),
@@ -39,6 +43,7 @@ impl ProxyProver {
         self.refs = Some(alloc_proxy_refs(
             &mut self.vm,
             &mut self.prf,
+            &mut self.ks13,
             &mut self.cf_vd_check,
             &mut self.sf_vd_check,
             MsVisibility::Private,
@@ -55,25 +60,38 @@ impl ProxyProver {
     }
 
     pub(crate) async fn finalize(
-        mut self,
+        self,
         secrets: CapturedSecrets,
         time: u64,
         traffic: TlsBytes,
     ) -> Result<(Context, ProverZk, TlsOutput), TlsnError> {
-        // TLS 1.3 finalization is not implemented yet. Capturing the 1.3 secrets
-        // (this work item) is complete, but driving the `KeySchedule13` ZK graph
-        // and the 1.3 transcript/record proofs is work-breakdown item 8
-        // (`specs/tls13-proxy.md` §8). The production client only negotiates TLS
-        // 1.2, so this arm is unreachable at runtime today.
-        let ms: [u8; 48] = match secrets {
-            CapturedSecrets::V1_2 { ms } => ms,
-            CapturedSecrets::V1_3 { .. } => {
-                return Err(TlsnError::internal().with_msg(
-                    "TLS 1.3 proxy finalize flow is not implemented (work-breakdown item 8)",
-                ));
+        match secrets {
+            CapturedSecrets::V1_2 { ms } => self.finalize_v1_2(ms, time, traffic).await,
+            CapturedSecrets::V1_3 {
+                handshake_secret,
+                client_hs_traffic_secret,
+                server_hs_traffic_secret,
+            } => {
+                self.finalize_v1_3(
+                    handshake_secret,
+                    client_hs_traffic_secret,
+                    server_hs_traffic_secret,
+                    time,
+                    traffic,
+                )
+                .await
             }
-        };
+        }
+    }
 
+    /// TLS 1.2 finalize flow (PRF key derivation + cf/sf verify-data).
+    /// Byte-for- byte the original proxy-mode flow.
+    async fn finalize_v1_2(
+        mut self,
+        ms: [u8; 48],
+        time: u64,
+        traffic: TlsBytes,
+    ) -> Result<(Context, ProverZk, TlsOutput), TlsnError> {
         let tls_transcript = TlsTranscript::builder()
             .time(time)
             .tls_sent(&traffic.tls_sent)
@@ -175,7 +193,126 @@ impl ProxyProver {
 
         tracing::info!("Proxy TLS done");
         let output = TlsOutput {
-            keys: refs.keys,
+            keys: ProxyKeys::V1_2(refs.keys),
+            tls_transcript,
+        };
+
+        Ok((self.ctx, self.vm, output))
+    }
+
+    /// TLS 1.3 finalize flow (parent spec §6/§8).
+    ///
+    /// The order is inverted relative to 1.2: the ZK key schedule must run
+    /// **before** the transcript can be built, because decrypting the handshake
+    /// flight needs the disclosed `c_hs`/`s_hs`, which the schedule produces
+    /// from `h2`. Then the built transcript's `h3` feeds the schedule's second
+    /// phase to derive the application keys.
+    async fn finalize_v1_3(
+        mut self,
+        handshake_secret: [u8; 32],
+        client_hs_traffic_secret: [u8; 32],
+        server_hs_traffic_secret: [u8; 32],
+        time: u64,
+        traffic: TlsBytes,
+    ) -> Result<(Context, ProverZk, TlsOutput), TlsnError> {
+        // 1. Pre-parse `h2 = H(CH..SH)` from the plaintext wire records.
+        let (_version, h2) = peek_tls_version_and_sh_hash(&traffic.tls_sent, &traffic.tls_recv)
+            .map_err(|e| {
+                TlsnError::internal()
+                    .with_msg("prover could not peek tls 1.3 sh hash")
+                    .with_source(e)
+            })?;
+
+        let mut refs = self.refs.expect("key refs should be available");
+
+        // 2. Assign the (private) handshake secret to the ZK key schedule.
+        tracing::debug!("driving TLS 1.3 key schedule (phase 1)...");
+        self.vm
+            .assign(refs.hs, handshake_secret)
+            .map_err(|e| TlsnError::internal().with_source(e))?;
+        self.vm
+            .commit(refs.hs)
+            .map_err(|e| TlsnError::internal().with_source(e))?;
+
+        // 3. Phase 1: `h2` unblocks `c_hs`/`s_hs`.
+        self.ks13
+            .set_sh_hash(h2)
+            .map_err(|e| TlsnError::internal().with_source(e))?;
+        while self.ks13.wants_flush() {
+            self.ks13
+                .flush(&mut self.vm)
+                .map_err(|e| TlsnError::internal().with_source(e))?;
+            self.vm
+                .execute_all(&mut self.ctx)
+                .await
+                .map_err(|e| TlsnError::internal().with_source(e))?;
+        }
+
+        // 4. Decode the disclosed handshake traffic secrets.
+        let c_hs = refs
+            .c_hs
+            .try_recv()
+            .map_err(|e| TlsnError::internal().with_source(e))?
+            .ok_or(TlsnError::internal().with_msg("unable to receive c_hs from decoding"))?;
+        let s_hs = refs
+            .s_hs
+            .try_recv()
+            .map_err(|e| TlsnError::internal().with_source(e))?
+            .ok_or(TlsnError::internal().with_msg("unable to receive s_hs from decoding"))?;
+
+        // 5. The ZK-derived secrets must equal the captured ones; otherwise the
+        // captured `handshake_secret` is inconsistent with the wire transcript.
+        if c_hs != client_hs_traffic_secret || s_hs != server_hs_traffic_secret {
+            return Err(TlsnError::internal().with_msg(
+                "TLS 1.3 handshake traffic secrets do not match the ZK key schedule output",
+            ));
+        }
+
+        // 6. Build the transcript, decrypting the handshake flight with the
+        // disclosed secrets. This also computes `h2`/`h3`.
+        let tls_transcript = TlsTranscript::builder()
+            .time(time)
+            .tls_sent(&traffic.tls_sent)
+            .tls_recv(&traffic.tls_recv)
+            .app_sent(&traffic.app_sent)
+            .app_recv(&traffic.app_recv)
+            .handshake_secrets(c_hs, s_hs)
+            .build()
+            .map_err(|e| {
+                TlsnError::internal()
+                    .with_msg("prover could not build tls 1.3 transcript")
+                    .with_source(e)
+            })?;
+        tracing::debug!("successfully parsed tls 1.3 transcript");
+
+        // 7. `h3 = H(CH..server Finished)` feeds the schedule's second phase.
+        let h3 = tls_transcript
+            .tls13_sf_hash()
+            .ok_or(TlsnError::internal().with_msg("tls 1.3 sf hash should be available"))?;
+
+        tracing::debug!("driving TLS 1.3 key schedule (phase 2)...");
+        self.ks13
+            .set_sf_hash(h3)
+            .map_err(|e| TlsnError::internal().with_source(e))?;
+        while self.ks13.wants_flush() {
+            self.ks13
+                .flush(&mut self.vm)
+                .map_err(|e| TlsnError::internal().with_source(e))?;
+            self.vm
+                .execute_all(&mut self.ctx)
+                .await
+                .map_err(|e| TlsnError::internal().with_source(e))?;
+        }
+
+        tracing::info!("Proxy TLS 1.3 done");
+        let output = TlsOutput {
+            keys: ProxyKeys::V1_3 {
+                client_write_key: refs.keys13.client_write_key,
+                client_write_iv: refs.keys13.client_iv,
+                server_write_key: refs.keys13.server_write_key,
+                server_write_iv: refs.keys13.server_iv,
+                server_write_mac_key: refs.server_write_mac_key13,
+            },
             tls_transcript,
         };
 

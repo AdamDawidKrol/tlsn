@@ -3,7 +3,6 @@
 use std::marker::PhantomData;
 
 use futures_plex::DuplexStream;
-use mpc_tls::SessionKeys;
 use mpz_common::Context;
 use tlsn_core::{
     connection::ServerName,
@@ -14,6 +13,7 @@ use crate::{
     Error, TlsOutput,
     deps::{ProverDeps, ProverZk},
     prover::{ProverControl, client::TlsClient},
+    proxy::ProxyKeys,
 };
 
 /// Entry state
@@ -56,7 +56,7 @@ opaque_debug::implement!(Connected<S>);
 pub struct Committed {
     pub(crate) vm: ProverZk,
     pub(crate) server_name: ServerName,
-    pub(crate) keys: SessionKeys,
+    pub(crate) keys: ProxyKeys,
     pub(crate) tls_transcript: TlsTranscript,
     pub(crate) transcript: Transcript,
 }

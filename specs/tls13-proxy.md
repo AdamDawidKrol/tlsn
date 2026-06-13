@@ -470,8 +470,8 @@ version dispatch calling the V1_3 `HandshakeData::verify` path (§6.3).
 | 5 | Cleartext 1.3 handshake decrypt/verify, `CertBindingV1_3`, builder 1.3 path, `Record` semantics | `tlsn-core` | §6; DONE (spec `specs/tasks/tls13-core-handshake.md`; 104/104 tests). See integration notes below. |
 | 6 | `verify_tags` 1.3 branch | `tlsn` | §7.2; DONE (spec `specs/tasks/tls13-verify-tags.md`; `src/tag.rs` `TagKeyIv` enum, 4 new tests). See integration notes below. |
 | 7 | Plaintext-proof suffix handling + range math | `tlsn` (`transcript_internal`) | §7.3; DONE (spec `specs/tasks/tls13-plaintext-proofs.md`; `CipherParams` enum + suffix/range math, 24 new tests). See integration notes below. |
-| 8 | Prover/verifier finalize flows, config plumbing | `tlsn` | §8; spec `specs/tasks/tls13-finalize-flows.md`; integration step — deps items 1, 5, 6, 7 all DONE — **unblocked** |
-| 9 | Fixtures + tests + bench | `tls-server-fixture`, `harness`, `core` fixtures | §9.1; owns the full webpki cert-chain happy path + live 1.3 capture deferred from item 5 |
+| 8 | Prover/verifier finalize flows, config plumbing | `tlsn` | §8; spec `specs/tasks/tls13-finalize-flows.md`; **DONE (wiring)**: `ProxyKeys` versioned key handle (`TlsOutput.keys`); dual-graph allocation (`Prf` + `KeySchedule13`) in `alloc_proxy_refs`; reordered 1.3 finalize (schedule phase-1 discloses `c_hs`/`s_hs` → build transcript → phase-2 from `h3`) on both prover & verifier; `tlsn-core` accessors `peek_tls_version_and_sh_hash` + `TlsTranscript::tls13_{sh,sf}_hash`; version-dispatched `verify_tags` / `prove`/`verify` / `HandshakeData::verify` / cf-sf checks. New hermetic unit tests; 1.2 e2e (`test_proxy`) unchanged. **Deferred to item 9**: flipping the client version list to offer 1.3 (the shared fixture auto-negotiates 1.3) and the prover→verifier per-record content-length / inner-plaintext channel — both need the 1.3-enabled fixture. |
+| 9 | Fixtures + tests + bench | `tls-server-fixture`, `harness`, `core` fixtures | §9.1; owns the full webpki cert-chain happy path + live 1.3 capture deferred from item 5; **also owns** turning on the 1.3 client version list (item 8 left it 1.2-only so the shared fixture keeps negotiating 1.2), the per-record content-length/inner-plaintext metadata channel (open-question §5), and the dual-allocation cost bench (open-question §2) |
 
 Suggested order: 1 (DONE) → 2+4 (DONE) → 5 ∥ 3 (DONE) → 6 ∥ 7 (DONE) →
 **8** (unblocked now; all deps landed) → 9.
@@ -593,14 +593,25 @@ the branch reviewable and bisectable, with each commit building on its own.
    `handshake_secret` directly and the full §5 derivation chain was validated
    in cleartext against the keylog. No fork needed. The spike also confirmed
    the §5 math and the wasm build poses no incremental risk.
-2. **Dual allocation cost** (both 1.2 and 1.3 graphs in the ZK VM): measure;
-   decide between always-both vs config knob.
+2. **Dual allocation cost** (both 1.2 and 1.3 graphs in the ZK VM): **decision
+   for v1 = always-both** (implemented in `alloc_proxy_refs`: the `Prf` and
+   `KeySchedule13` graphs are both allocated since the negotiated version is
+   unknown at preprocessing; only the negotiated one is driven at finalize, the
+   other is never flushed/executed). The actual preprocessing cost measurement
+   (always-both vs a config knob) is **pending the item-9 harness bench** — item
+   8 did not block on the §9 decision gate.
 3. **HRR**: rejected in v1. If telemetry shows meaningful failure rates with
    secp256r1-only, either enable X25519 for 1.3 (no attestation impact) or
    implement the `message_hash` transcript-reset rule in the builder.
-4. **`SessionKeys` shape**: how the 12-byte IVs flow through `TlsOutput` to
-   the record proofs without disturbing the MPC-mode 1.2 type (likely an enum
-   or generic widening).
+4. **`SessionKeys` shape**: ~~how the 12-byte IVs flow through `TlsOutput` to
+   the record proofs without disturbing the MPC-mode 1.2 type~~ **RESOLVED** —
+   item 8 introduced the `ProxyKeys` enum (`crates/tlsn/src/proxy.rs`):
+   `V1_2(mpc_tls::SessionKeys)` keeps MPC mode's 1.2 type byte-for-byte (it is
+   wrapped at `TlsOutput` construction), and `V1_3 { 16B keys + 12B IVs + GHASH
+   key }` carries the 1.3 material. Helpers `recv_tag_key_iv()` /
+   `sent_cipher_params()` / `recv_cipher_params()` / `server_write_mac_key()`
+   produce the version-correct `TagKeyIv` / `CipherParams` so call sites never
+   branch on the version. `mpc_tls::SessionKeys` is untouched.
 5. **Padding from servers**: v1 treats `type || padding` as a disclosed public
    suffix per record (§7.3). Confirm no application-data leakage concern from
    disclosing padding lengths (the verifier already sees record lengths on the

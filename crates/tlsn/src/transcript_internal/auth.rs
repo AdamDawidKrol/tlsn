@@ -35,9 +35,6 @@ pub(crate) enum CipherParams {
         key: Array<U8, 16>,
         iv: Array<U8, 4>,
     },
-    // Constructed by the TLS 1.3 finalize flow (item 8); until then the call
-    // sites stay on `V1_2` and this variant is exercised by the unit tests.
-    #[allow(dead_code)]
     V1_3 {
         key: Array<U8, 16>,
         iv: Array<U8, 12>,
@@ -551,10 +548,10 @@ impl RecordParams {
     ///   is public metadata conveyed by the prover (the padding length, parent
     ///   §10 open-question 5) and is *validated* by the `type || padding`
     ///   suffix proof — a misdeclared boundary makes the disclosed suffix fail
-    ///   to match the wire ciphertext. Wiring that metadata through the
-    ///   finalize flow is item 8; until then this falls back to `inner_len` and
-    ///   1.3 is exercised via the unit tests that construct [`RecordParams`]
-    ///   directly.
+    ///   to match the wire ciphertext. Threading that metadata through the
+    ///   finalize flow is the item-9 fixture work; until then the verifier
+    ///   falls back to `inner_len` and 1.3 is exercised via the unit tests that
+    ///   construct [`RecordParams`] directly.
     fn from_records<'a>(
         cipher: &CipherParams,
         records: impl IntoIterator<Item = &'a Record>,
