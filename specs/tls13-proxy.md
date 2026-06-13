@@ -463,18 +463,18 @@ version dispatch calling the V1_3 `HandshakeData::verify` path (§6.3).
 
 | # | Item | Crate(s) | Notes |
 |---|---|---|---|
-| 1 | `SecretLog` + HKDF-capturing `CryptoProvider` | `tlsn` | §4; spike DONE (passed) — productionize `crates/spikes/tls13-secret-capture` |
+| 1 | `SecretLog` + HKDF-capturing `CryptoProvider` | `tlsn` | §4; DONE (`prover/client/proxy/capture.rs` + `keylog.rs`; `CapturedSecrets` enum; `ProxyProver::finalize(CapturedSecrets)` with V1_3 error seam; bounded process-global `CapturePool`; 2 new tests incl. real 1.3 handshake capture; production still 1.2-only). See integration notes below. |
 | 2 | `KeySchedule13` ZK graph + RFC 8448 vectors | `hmac-sha256` | §5; DONE (`src/key_schedule.rs`, 22/22 tests incl. RFC 8448) |
 | 3 | XOR-nonce CTR block variant | `cipher` | §7.1; DONE (spec `specs/tasks/tls13-cipher-xor-nonce.md`; `src/aes/mod.rs`, 5/5 tests incl. NIST GCM KAT). See integration notes below. |
 | 4 | `make_tls13_aad` | `tls-core` | DONE (`src/cipher.rs`, `fn make_tls13_aad(len) -> [u8; 5]`, len includes tag) |
 | 5 | Cleartext 1.3 handshake decrypt/verify, `CertBindingV1_3`, builder 1.3 path, `Record` semantics | `tlsn-core` | §6; DONE (spec `specs/tasks/tls13-core-handshake.md`; 104/104 tests). See integration notes below. |
-| 6 | `verify_tags` 1.3 branch | `tlsn` | §7.2; spec `specs/tasks/tls13-verify-tags.md`; depends on item 3 (DONE) — unblocked |
-| 7 | Plaintext-proof suffix handling + range math | `tlsn` (`transcript_internal`) | §7.3; spec `specs/tasks/tls13-plaintext-proofs.md`; depends on items 3+5 (DONE) — unblocked |
-| 8 | Prover/verifier finalize flows, config plumbing | `tlsn` | §8; spec `specs/tasks/tls13-finalize-flows.md`; integration step — depends on items 1, 5, 6, 7 |
+| 6 | `verify_tags` 1.3 branch | `tlsn` | §7.2; DONE (spec `specs/tasks/tls13-verify-tags.md`; `src/tag.rs` `TagKeyIv` enum, 4 new tests). See integration notes below. |
+| 7 | Plaintext-proof suffix handling + range math | `tlsn` (`transcript_internal`) | §7.3; DONE (spec `specs/tasks/tls13-plaintext-proofs.md`; `CipherParams` enum + suffix/range math, 24 new tests). See integration notes below. |
+| 8 | Prover/verifier finalize flows, config plumbing | `tlsn` | §8; spec `specs/tasks/tls13-finalize-flows.md`; integration step — deps items 1, 5, 6, 7 all DONE — **unblocked** |
 | 9 | Fixtures + tests + bench | `tls-server-fixture`, `harness`, `core` fixtures | §9.1; owns the full webpki cert-chain happy path + live 1.3 capture deferred from item 5 |
 
-Suggested order: 1 (spike, DONE) → 2+4 (DONE) → 5 ∥ 3 (DONE) → **6 ∥ 7**
-(both unblocked now) → 8 → 9.
+Suggested order: 1 (DONE) → 2+4 (DONE) → 5 ∥ 3 (DONE) → 6 ∥ 7 (DONE) →
+**8** (unblocked now; all deps landed) → 9.
 
 ### Commit hygiene (rule)
 
@@ -529,6 +529,39 @@ the branch reviewable and bisectable, with each commit building on its own.
   TLS 1.3 wire capture (RFC 8448's 1024-bit/SAN-less cert is rejected by
   webpki). Item 5 validated decrypt/verify via synthetic RFC 8448 wire data
   plus `connection.rs` dispatch tests.
+
+### Integration notes from items 1, 6 & 7 (as built)
+
+- **Item 1 — secret capture (`tlsn`)**: `MasterSecretLog` is replaced by
+  `SecretLog` in `crates/tlsn/src/prover/client/proxy/keylog.rs`, which yields
+  `CapturedSecrets::{ V1_2 { ms: [u8;48] }, V1_3 { handshake_secret,
+  client_hs_traffic_secret, server_hs_traffic_secret: [u8;32] } }`. The
+  HKDF-capturing provider lives in `prover/client/proxy/capture.rs`; leaked
+  (suite+wrapper) instances recycle through a process-global `CapturePool`
+  (`OnceLock`) leased per connection. `mod client`/`mod proxy` were widened to
+  `pub(crate)` so `CapturedSecrets` is nameable; `hmac`+`sha2` were added as
+  `tlsn` deps. **Production still pins `with_protocol_versions(&[&TLS12])`** —
+  the capturing 1.3 suite is in `cipher_suites` but never offered until item 8
+  flips the version list.
+- **Item 1 finalize seam**: `ProxyProver::finalize` now takes
+  `CapturedSecrets` (was `Vec<u8>`). The `V1_2 { ms }` arm is the prior 1.2
+  flow byte-for-byte; the `V1_3 { .. }` arm currently returns a typed
+  `TlsnError` ("…not implemented (work-breakdown item 8)"). **Item 8 fills this
+  arm** — and that is also where `with_protocol_versions` gains
+  `&rustls::version::TLS13`. The `#[allow(dead_code)]` on the `V1_3` fields can
+  be removed once item 8 consumes them.
+- **Item 6 — `verify_tags` (`tlsn`)**: signature is
+  `verify_tags(vm, key_iv: TagKeyIv, mac_key, records)` (the standalone
+  `tls_version` arg was removed; it is derived from the variant).
+  `TagKeyIv::V1_3` carries a temporary `#[allow(dead_code)]` to drop when
+  item 8 constructs it.
+- **Item 7 — plaintext proofs (`tlsn`)**: `prove_plaintext` / `verify_plaintext`
+  take `cipher: CipherParams` (`V1_2 { iv:[u8;4] }` / `V1_3 { iv:[u8;12] }`).
+  `RecordParams` gained `seq`/`inner_len`/`content_len`; the 1.3 `content_len`
+  still falls back to `inner_len` until item 8 threads real per-record content
+  lengths (prover: `record.plaintext.len()`; verifier: prover-declared, validated
+  by the suffix proof). The verifier length check now routes through a
+  `content_len()` helper in `verifier/verify.rs`.
 
 ### 9.1 Test plan
 
