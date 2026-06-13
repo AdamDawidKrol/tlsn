@@ -48,6 +48,8 @@ mpz-ideal-vm = { workspace = true }
 aes = { workspace = true }
 ctr = { workspace = true }
 futures = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
 opaque-debug = { workspace = true }
 pin-project-lite = { workspace = true }
 rand = { workspace = true }

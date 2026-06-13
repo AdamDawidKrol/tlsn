@@ -24,8 +24,10 @@ use tlsn_core::config::tls::TlsClientConfig;
 use tracing::{debug, trace};
 use webpki::anchor_from_trusted_cert;
 
-mod keylog;
-use keylog::MasterSecretLog;
+mod capture;
+pub(crate) mod keylog;
+use capture::{CaptureLease, CapturePool};
+use keylog::SecretLog;
 
 const ALLOWED_GROUPS: &[NamedGroup] = &[NamedGroup::secp256r1];
 const ALLOWED_SUITES: &[CipherSuite] = &[
@@ -35,7 +37,10 @@ const ALLOWED_SUITES: &[CipherSuite] = &[
 
 pub(crate) struct ProxyTlsClient {
     conn: ClientConnection,
-    ms_log: Arc<MasterSecretLog>,
+    secret_log: Arc<SecretLog>,
+    // Returns the leaked capturing TLS 1.3 suite to the pool when this client is
+    // dropped, so the leak stays bounded by peak concurrency.
+    _capture_lease: CaptureLease,
     time: Option<u64>,
     traffic: TlsBytes,
     client_closed: bool,
@@ -78,7 +83,7 @@ impl ProxyTlsClient {
             .filter(|g| ALLOWED_GROUPS.contains(&g.name()))
             .copied()
             .collect();
-        let cipher_suites: Vec<SupportedCipherSuite> = provider
+        let mut cipher_suites: Vec<SupportedCipherSuite> = provider
             .cipher_suites
             .iter()
             .filter(|s| match s {
@@ -87,15 +92,23 @@ impl ProxyTlsClient {
             })
             .copied()
             .collect();
+
+        // Lease the secret-capturing TLS 1.3 suite and wire it into the
+        // provider so TLS 1.3 secret capture is ready. This is harmless while
+        // the protocol version list stays 1.2-only (see `create_client_config`):
+        // rustls will not offer the 1.3 suite, so real sessions stay on 1.2.
+        let capture_lease = CapturePool::lease();
+        cipher_suites.push(capture_lease.suite());
+
         let provider = CryptoProvider {
             kx_groups,
             cipher_suites,
             ..provider
         };
 
-        let ms_log = Arc::new(MasterSecretLog::default());
+        let secret_log = Arc::new(SecretLog::new(capture_lease.log()));
         let mut config = create_client_config(config, provider)?;
-        config.key_log = ms_log.clone();
+        config.key_log = secret_log.clone();
 
         let conn = ClientConnection::new(Arc::new(config), server_name.into_pki_server_name())
             .map_err(|err| {
@@ -110,7 +123,8 @@ impl ProxyTlsClient {
 
         let tls_client = Self {
             conn,
-            ms_log,
+            secret_log,
+            _capture_lease: capture_lease,
             time: None,
             traffic: TlsBytes::default(),
             client_closed: false,
@@ -246,18 +260,13 @@ impl TlsClient for ProxyTlsClient {
                 })?;
 
                 if self.server_closed {
-                    let ms = self.ms_log.take();
-                    if ms.is_empty() {
-                        return Poll::Ready(Err(
-                            TlsnError::internal().with_msg("master secret is not available")
-                        ));
-                    }
+                    let captured = self.secret_log.take()?;
                     let time = self.time.ok_or_else(|| {
                         TlsnError::internal().with_msg("connection timestamp is not set")
                     })?;
                     let traffic = std::mem::take(&mut self.traffic);
 
-                    let fut = Box::pin(prover.finalize(ms, time, traffic));
+                    let fut = Box::pin(prover.finalize(captured, time, traffic));
 
                     self.state = State::Finalizing { fut };
                     self.poll(cx)

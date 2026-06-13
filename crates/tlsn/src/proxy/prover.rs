@@ -1,6 +1,7 @@
 use crate::{
     Error as TlsnError, TlsOutput,
     deps::ProverZk,
+    prover::client::proxy::keylog::CapturedSecrets,
     proxy::{MsVisibility, References, TlsBytes, VerifyDataCheck, alloc_proxy_refs},
 };
 use hmac_sha256::{MSMode, NetworkMode, Prf, PrfConfig};
@@ -55,10 +56,24 @@ impl ProxyProver {
 
     pub(crate) async fn finalize(
         mut self,
-        ms: Vec<u8>,
+        secrets: CapturedSecrets,
         time: u64,
         traffic: TlsBytes,
     ) -> Result<(Context, ProverZk, TlsOutput), TlsnError> {
+        // TLS 1.3 finalization is not implemented yet. Capturing the 1.3 secrets
+        // (this work item) is complete, but driving the `KeySchedule13` ZK graph
+        // and the 1.3 transcript/record proofs is work-breakdown item 8
+        // (`specs/tls13-proxy.md` §8). The production client only negotiates TLS
+        // 1.2, so this arm is unreachable at runtime today.
+        let ms: [u8; 48] = match secrets {
+            CapturedSecrets::V1_2 { ms } => ms,
+            CapturedSecrets::V1_3 { .. } => {
+                return Err(TlsnError::internal().with_msg(
+                    "TLS 1.3 proxy finalize flow is not implemented (work-breakdown item 8)",
+                ));
+            }
+        };
+
         let tls_transcript = TlsTranscript::builder()
             .time(time)
             .tls_sent(&traffic.tls_sent)
@@ -74,9 +89,6 @@ impl ProxyProver {
         tracing::debug!("successfully parsed transcript");
 
         let mut refs = self.refs.expect("key refs should be available");
-        let ms: [u8; 48] = ms
-            .try_into()
-            .map_err(|_| TlsnError::internal().with_msg("ms has wrong length"))?;
 
         let cf_hash: [u8; 32] = tls_transcript
             .cf_hash()

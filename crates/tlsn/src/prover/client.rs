@@ -12,7 +12,7 @@ use std::{
 mod mpc;
 pub(crate) use mpc::MpcTlsClient;
 
-mod proxy;
+pub(crate) mod proxy;
 use mpz_common::Context;
 pub(crate) use proxy::ProxyTlsClient;
 

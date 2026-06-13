@@ -1,6 +1,6 @@
 //! Prover.
 
-mod client;
+pub(crate) mod client;
 mod conn;
 mod control;
 mod future;
