@@ -16,6 +16,13 @@ pub struct TlsClientConfig {
     /// Certificate chain and a matching private key for client
     /// authentication.
     client_auth: Option<(Vec<CertificateDer>, PrivateKeyDer)>,
+    /// Whether to offer TLS 1.3 (in addition to 1.2) during the handshake.
+    ///
+    /// Defaults to `false`: the client offers only TLS 1.2, so every session
+    /// negotiates 1.2. Set to `true` to additionally offer 1.3, letting a
+    /// 1.3-capable server negotiate it (proxy mode only). This is the per-
+    /// session opt-in for the TLS 1.3 proxy path.
+    enable_tls13: bool,
 }
 
 impl TlsClientConfig {
@@ -39,6 +46,11 @@ impl TlsClientConfig {
     pub fn client_auth(&self) -> Option<&(Vec<CertificateDer>, PrivateKeyDer)> {
         self.client_auth.as_ref()
     }
+
+    /// Returns whether TLS 1.3 is offered (in addition to 1.2).
+    pub fn enable_tls13(&self) -> bool {
+        self.enable_tls13
+    }
 }
 
 /// Builder for [`TlsClientConfig`].
@@ -47,6 +59,7 @@ pub struct TlsConfigBuilder {
     server_name: Option<ServerName>,
     root_store: Option<RootCertStore>,
     client_auth: Option<(Vec<CertificateDer>, PrivateKeyDer)>,
+    enable_tls13: bool,
 }
 
 impl TlsConfigBuilder {
@@ -80,6 +93,13 @@ impl TlsConfigBuilder {
         self
     }
 
+    /// Offers TLS 1.3 (in addition to 1.2) during the handshake. Defaults to
+    /// `false` (1.2 only). Proxy mode only.
+    pub fn enable_tls13(mut self, enable: bool) -> Self {
+        self.enable_tls13 = enable;
+        self
+    }
+
     /// Builds the TLS configuration.
     pub fn build(self) -> Result<TlsClientConfig, TlsConfigError> {
         let server_name = self.server_name.ok_or(ErrorRepr::MissingField {
@@ -94,6 +114,7 @@ impl TlsConfigBuilder {
             server_name,
             root_store,
             client_auth: self.client_auth,
+            enable_tls13: self.enable_tls13,
         })
     }
 }

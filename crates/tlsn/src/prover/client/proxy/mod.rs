@@ -50,8 +50,15 @@ const ALLOWED_SUITES: &[CipherSuite] = &[
 static PROXY_SIG_ALGS: WebPkiSupportedAlgorithms = WebPkiSupportedAlgorithms {
     all: &[
         webpki::ring::ECDSA_P256_SHA256,
+        webpki::ring::ECDSA_P256_SHA384,
+        webpki::ring::ECDSA_P384_SHA256,
+        webpki::ring::ECDSA_P384_SHA384,
         webpki::ring::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
+        webpki::ring::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
+        webpki::ring::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
         webpki::ring::RSA_PKCS1_2048_8192_SHA256,
+        webpki::ring::RSA_PKCS1_2048_8192_SHA384,
+        webpki::ring::RSA_PKCS1_2048_8192_SHA512,
     ],
     mapping: &[
         (
@@ -358,15 +365,22 @@ fn create_client_config(
         root_store.roots.push(anchor);
     }
 
-    // Offer both TLS 1.3 and 1.2, server-negotiated (parent spec §2/§8, item 9).
-    // The negotiated version is therefore driven by the server: against a
-    // 1.3-capable server rustls picks 1.3 (the capturing 1.3 suite leased above
-    // is the only 1.3 suite offered, so its secrets are always available at
-    // finalize); against a 1.2-only server it falls back to 1.2. `secp256r1`
-    // stays the only key-exchange group (parent §8), and `Resumption::disabled()`
+    // Version offering is opt-in per session (`TlsClientConfig::enable_tls13`,
+    // default false). When enabled we offer both 1.3 and 1.2 and the server
+    // negotiates (a 1.3-capable server picks 1.3 — the capturing 1.3 suite
+    // leased above is the only 1.3 suite offered, so its secrets are always
+    // available at finalize; a 1.2-only server falls back to 1.2). When
+    // disabled we offer 1.2 only, so every session is 1.2 — this keeps the
+    // default fleet on the established 1.2 path and gates 1.3 behind the flag.
+    // `secp256r1` stays the only key-exchange group; `Resumption::disabled()`
     // (below) keeps PSK/0-RTT off.
+    let versions: &[&rustls::SupportedProtocolVersion] = if config.enable_tls13() {
+        &[&rustls::version::TLS13, &rustls::version::TLS12]
+    } else {
+        &[&rustls::version::TLS12]
+    };
     let builder = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .with_protocol_versions(versions)
         .map_err(|e| {
             TlsnError::config()
                 .with_msg("failed to set protocol versions")
