@@ -59,46 +59,82 @@ use tlsn_server_fixture_certs::{CA_CERT_DER, SERVER_DOMAIN};
 
 const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36";
 
+/// Application headers sent against the in-repo fixture.
+const FIXTURE_HEADERS: &[(&str, &str)] = &[("Accept", "*/*"), ("User-Agent", USER_AGENT)];
+
+/// Default request path + headers for the public lvbet endpoint, mirroring the
+/// interactive `proxy_real` example so this attestation example can target the
+/// same endpoint (used when `SERVER_HOST` is set and no overrides are given).
+const LVBET_PATH: &str = "/client-betslips/v3/details/NFRR7MTHMYG";
+const LVBET_HEADERS: &[(&str, &str)] = &[
+    ("device", "web (website)"),
+    ("Referer", "https://lvbet.pl/"),
+    ("Accept-Language", "pl-PL,pl;q=0.5"),
+    ("Accept", "application/json, text/plain, */*"),
+    ("Content-Type", "application/json"),
+    ("Content-language", "pl"),
+    (
+        "User-Agent",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 \
+         (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+    ),
+];
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    let request_path = env::var("REQUEST_PATH").unwrap_or_else(|_| "/formats/json".into());
+    let server_host = env::var("SERVER_HOST").ok();
+    let real_endpoint = server_host.is_some();
 
     // The notary dials `server_addr` in proxy mode. By default we spin up the
     // in-repo fixture (pinned to TLS 1.3) on a loopback port so the example is
     // self-contained and deterministic; with `SERVER_HOST` set we instead point
-    // at a real endpoint using Mozilla roots.
-    let (server_domain, root_store, server_addr, fixture_task) =
-        if let Ok(host) = env::var("SERVER_HOST") {
-            let port: u16 = env::var("SERVER_PORT")
-                .ok()
-                .and_then(|port| port.parse().ok())
-                .unwrap_or(443);
-            let domain = env::var("SERVER_DOMAIN").unwrap_or_else(|_| host.clone());
-            let addr = tokio::net::lookup_host((host.as_str(), port))
-                .await
-                .context("DNS resolution failed")?
-                .next()
-                .context("no address resolved")?;
-            (domain, RootCertStore::mozilla(), addr, None)
+    // at a real endpoint (e.g. the public lvbet endpoint) using Mozilla roots.
+    let (server_domain, root_store, server_addr, fixture_task) = if let Some(host) = server_host {
+        let port: u16 = env::var("SERVER_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(443);
+        let domain = env::var("SERVER_DOMAIN").unwrap_or_else(|_| host.clone());
+        let addr = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .context("DNS resolution failed")?
+            .next()
+            .context("no address resolved")?;
+        (domain, RootCertStore::mozilla(), addr, None)
+    } else {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            stream.set_nodelay(true)?;
+            bind_with_versions(stream.compat(), TLS13_ONLY).await
+        });
+        (
+            SERVER_DOMAIN.to_string(),
+            RootCertStore {
+                roots: vec![CertificateDer(CA_CERT_DER.to_vec())],
+            },
+            addr,
+            Some(task),
+        )
+    };
+
+    // Default request path + headers mirror the interactive `proxy_real` example
+    // when targeting a real endpoint, and the fixture's JSON route otherwise.
+    let request_path = env::var("REQUEST_PATH").unwrap_or_else(|_| {
+        if real_endpoint {
+            LVBET_PATH.into()
         } else {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-            let addr = listener.local_addr()?;
-            let task = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await?;
-                stream.set_nodelay(true)?;
-                bind_with_versions(stream.compat(), TLS13_ONLY).await
-            });
-            (
-                SERVER_DOMAIN.to_string(),
-                RootCertStore {
-                    roots: vec![CertificateDer(CA_CERT_DER.to_vec())],
-                },
-                addr,
-                Some(task),
-            )
-        };
+            "/formats/json".into()
+        }
+    });
+    let extra_headers: &[(&str, &str)] = if real_endpoint {
+        LVBET_HEADERS
+    } else {
+        FIXTURE_HEADERS
+    };
 
     let (notary_socket, prover_socket) = tokio::io::duplex(1 << 23);
 
@@ -106,7 +142,14 @@ async fn main() -> Result<()> {
     let notary_task =
         tokio::spawn(async move { notary(notary_socket, server_addr, notary_root_store).await });
 
-    prover(prover_socket, server_domain, root_store, &request_path).await?;
+    prover(
+        prover_socket,
+        server_domain,
+        root_store,
+        &request_path,
+        extra_headers,
+    )
+    .await?;
 
     notary_task.await??;
     if let Some(task) = fixture_task {
@@ -121,6 +164,7 @@ async fn prover<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
     server_domain: String,
     root_store: RootCertStore,
     request_path: &str,
+    extra_headers: &[(&str, &str)],
 ) -> Result<()> {
     // Create a session with the notary.
     let session = Session::new(socket.compat());
@@ -152,16 +196,18 @@ async fn prover<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
         hyper::client::conn::http1::handshake(tls_connection).await?;
     tokio::spawn(connection);
 
-    let request = Request::builder()
+    let mut request_builder = Request::builder()
         .uri(request_path)
         .header("Host", server_domain.as_str())
-        .header("Accept", "*/*")
-        // "identity" instructs the server not to compress its response.
+        // "identity" instructs the server not to compress its response (TLSNotary
+        // tooling does not support compression).
         .header("Accept-Encoding", "identity")
         .header("Connection", "close")
-        .header("User-Agent", USER_AGENT)
-        .method("GET")
-        .body(Empty::<Bytes>::new())?;
+        .method("GET");
+    for (name, value) in extra_headers {
+        request_builder = request_builder.header(*name, *value);
+    }
+    let request = request_builder.body(Empty::<Bytes>::new())?;
 
     info!("Starting connection with the server");
 
