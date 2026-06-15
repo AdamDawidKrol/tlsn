@@ -25,7 +25,7 @@ use tlsn::{
         prove::ProveConfig, prover::ProverConfig, tls::TlsClientConfig,
         tls_commit::mpc::MpcTlsConfig, verifier::VerifierConfig,
     },
-    connection::{CertBinding, ConnectionInfo, HandshakeData, ServerName, TranscriptLength},
+    connection::{ConnectionInfo, HandshakeData, ServerName, TranscriptLength},
     prover::ProverOutput,
     transcript::{ContentType, TranscriptCommitConfig},
     verifier::{VerifierCommitStart, VerifierOutput},
@@ -365,9 +365,6 @@ async fn notary<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
     att_config_builder.supported_signature_algs(Vec::from_iter(provider.signer.supported_algs()));
     let att_config = att_config_builder.build()?;
 
-    let CertBinding::V1_2(binding) = tls_transcript.certificate_binding() else {
-        panic!("unsupported cert binding version");
-    };
     let mut builder = Attestation::builder(&att_config).accept_request(request)?;
     builder
         .connection_info(ConnectionInfo {
@@ -378,7 +375,7 @@ async fn notary<S: AsyncWrite + AsyncRead + Send + Sync + Unpin + 'static>(
                 received: recv_len as u32,
             },
         })
-        .server_ephemeral_key(binding.server_ephemeral_key.clone())
+        .cert_binding(tls_transcript.certificate_binding().clone())
         .transcript_commitments(transcript_commitments);
 
     let attestation = builder.build(&provider)?;

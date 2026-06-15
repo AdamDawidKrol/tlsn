@@ -8,7 +8,7 @@ version = "0.0.0"
 workspace = true
 
 [dependencies]
-tlsn = { workspace = true }
+tlsn = { workspace = true, features = ["mozilla-certs"] }
 tlsn-formats = { workspace = true }
 tls-server-fixture = { workspace = true }
 tlsn-server-fixture = { workspace = true }
@@ -48,12 +48,20 @@ name = "proxy"
 path = "proxy/proxy.rs"
 
 [[example]]
+name = "proxy_real"
+path = "proxy/proxy_real.rs"
+
+[[example]]
 name = "attestation_prove"
 path = "attestation/prove.rs"
 
 [[example]]
 name = "attestation_present"
 path = "attestation/present.rs"
+
+[[example]]
+name = "attestation_proxy_tls13"
+path = "attestation/proxy_tls13.rs"
 
 [[example]]
 name = "attestation_verify"
