@@ -44,7 +44,6 @@ macro_rules! impl_domain_separator {
 
 pub(crate) use impl_domain_separator;
 
-impl_domain_separator!(tlsn_core::connection::ServerEphemKey);
 impl_domain_separator!(tlsn_core::connection::ConnectionInfo);
 impl_domain_separator!(tlsn_core::connection::CertBinding);
 impl_domain_separator!(tlsn_core::transcript::TranscriptCommitment);

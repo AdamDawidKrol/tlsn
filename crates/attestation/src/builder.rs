@@ -3,7 +3,7 @@ use std::error::Error;
 use rand::{Rng, rng};
 
 use tlsn_core::{
-    connection::{ConnectionInfo, ServerEphemKey},
+    connection::{CertBinding, ConnectionInfo},
     hash::HashAlgId,
     transcript::TranscriptCommitment,
 };
@@ -23,7 +23,7 @@ pub struct Sign {
     signature_alg: SignatureAlgId,
     hash_alg: HashAlgId,
     connection_info: Option<ConnectionInfo>,
-    server_ephemeral_key: Option<ServerEphemKey>,
+    cert_binding: Option<CertBinding>,
     cert_commitment: ServerCertCommitment,
     extensions: Vec<Extension>,
     transcript_commitments: Vec<TranscriptCommitment>,
@@ -84,7 +84,7 @@ impl<'a> AttestationBuilder<'a, Accept> {
                 signature_alg,
                 hash_alg,
                 connection_info: None,
-                server_ephemeral_key: None,
+                cert_binding: None,
                 cert_commitment,
                 transcript_commitments: Vec::new(),
                 extensions,
@@ -100,9 +100,9 @@ impl AttestationBuilder<'_, Sign> {
         self
     }
 
-    /// Sets the server ephemeral key.
-    pub fn server_ephemeral_key(&mut self, key: ServerEphemKey) -> &mut Self {
-        self.state.server_ephemeral_key = Some(key);
+    /// Sets the certificate binding.
+    pub fn cert_binding(&mut self, binding: CertBinding) -> &mut Self {
+        self.state.cert_binding = Some(binding);
         self
     }
 
@@ -127,7 +127,7 @@ impl AttestationBuilder<'_, Sign> {
             signature_alg,
             hash_alg,
             connection_info,
-            server_ephemeral_key,
+            cert_binding,
             cert_commitment,
             extensions,
             transcript_commitments,
@@ -155,8 +155,8 @@ impl AttestationBuilder<'_, Sign> {
             connection_info: field_id.next(connection_info.ok_or_else(|| {
                 AttestationBuilderError::new(ErrorKind::Field, "connection info was not set")
             })?),
-            server_ephemeral_key: field_id.next(server_ephemeral_key.ok_or_else(|| {
-                AttestationBuilderError::new(ErrorKind::Field, "handshake data was not set")
+            cert_binding: field_id.next(cert_binding.ok_or_else(|| {
+                AttestationBuilderError::new(ErrorKind::Field, "certificate binding was not set")
             })?),
             cert_commitment: field_id.next(cert_commitment),
             extensions: extensions
@@ -241,11 +241,7 @@ impl std::fmt::Display for AttestationBuilderError {
 #[cfg(test)]
 mod test {
     use rstest::{fixture, rstest};
-    use tlsn_core::{
-        connection::{CertBinding, CertBindingV1_2},
-        fixtures::ConnectionFixture,
-        transcript::Transcript,
-    };
+    use tlsn_core::{fixtures::ConnectionFixture, transcript::Transcript};
     use tlsn_data_fixtures::http::{request::GET_WITH_HEADER, response::OK_JSON};
 
     use crate::fixtures::{RequestFixture, request_fixture};
@@ -327,7 +323,7 @@ mod test {
     }
 
     #[rstest]
-    fn test_attestation_builder_sign_missing_server_ephemeral_key(
+    fn test_attestation_builder_sign_missing_cert_binding(
         attestation_config: &AttestationConfig,
         crypto_provider: &CryptoProvider,
     ) {
@@ -370,15 +366,7 @@ mod test {
             server_cert_data, ..
         } = connection;
 
-        let CertBinding::V1_2(CertBindingV1_2 {
-            server_ephemeral_key,
-            ..
-        }) = server_cert_data.binding
-        else {
-            panic!("expected v1.2 handshake data");
-        };
-
-        attestation_builder.server_ephemeral_key(server_ephemeral_key);
+        attestation_builder.cert_binding(server_cert_data.binding);
 
         let err = attestation_builder.build(crypto_provider).unwrap_err();
         assert!(matches!(err.kind, ErrorKind::Field));
@@ -437,17 +425,9 @@ mod test {
             ..
         } = connection;
 
-        let CertBinding::V1_2(CertBindingV1_2 {
-            server_ephemeral_key,
-            ..
-        }) = server_cert_data.binding
-        else {
-            panic!("expected v1.2 handshake data");
-        };
-
         attestation_builder
             .connection_info(connection_info)
-            .server_ephemeral_key(server_ephemeral_key);
+            .cert_binding(server_cert_data.binding);
 
         let attestation = attestation_builder.build(crypto_provider).unwrap();
 

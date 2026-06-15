@@ -22,7 +22,7 @@
 use serde::{Deserialize, Serialize};
 
 use tlsn_core::{
-    connection::{HandshakeData, HandshakeVerificationError, ServerEphemKey, ServerName},
+    connection::{CertBinding, HandshakeData, HandshakeVerificationError, ServerName},
     hash::{Blinded, HashAlgorithm, HashProviderError, TypedHash},
 };
 
@@ -78,13 +78,13 @@ impl ServerIdentityProof {
     ///
     /// * `provider` - Crypto provider.
     /// * `time` - The time of the connection.
-    /// * `server_ephemeral_key` - The server's ephemeral key.
+    /// * `cert_binding` - The certificate binding the notary attested.
     /// * `commitment` - Commitment to the server certificate.
     pub fn verify_with_provider(
         self,
         provider: &CryptoProvider,
         time: u64,
-        server_ephemeral_key: &ServerEphemKey,
+        cert_binding: &CertBinding,
         commitment: &ServerCertCommitment,
     ) -> Result<ServerName, ServerIdentityProofError> {
         let hasher = provider.hash.get(&commitment.0.alg)?;
@@ -96,10 +96,25 @@ impl ServerIdentityProof {
             });
         }
 
+        // Anchor: the withheld handshake data must carry exactly the binding the
+        // notary attested.
+        let data = self.opening.data();
+        if data.binding != *cert_binding {
+            return Err(ServerIdentityProofError {
+                kind: ErrorKind::Certificate,
+                message: "binding does not match attestation".to_string(),
+            });
+        }
+
+        // Crypto verify; TLS 1.2 needs the ephemeral key, TLS 1.3 (and any
+        // future binding) signs the handshake transcript hash and ignores it.
+        let ephemeral = match cert_binding {
+            CertBinding::V1_2(binding) => Some(&binding.server_ephemeral_key),
+            _ => None,
+        };
+
         // Verify certificate and identity.
-        self.opening
-            .data()
-            .verify(&provider.cert, time, server_ephemeral_key, &self.name)?;
+        data.verify(&provider.cert, time, ephemeral, &self.name)?;
 
         Ok(self.name)
     }

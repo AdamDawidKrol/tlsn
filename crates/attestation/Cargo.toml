@@ -29,9 +29,11 @@ alloy-signer = { version = "1.0", default-features = false }
 alloy-signer-local = { version = "1.0", default-features = false }
 rand06-compat = { workspace = true }
 rangeset = { workspace = true }
+ring = { workspace = true }
 rstest = { workspace = true }
 tlsn-core = { workspace = true, features = ["fixtures"] }
 tlsn-data-fixtures = { workspace = true }
+tlsn-server-fixture-certs = { workspace = true }
 
 [lints]
 workspace = true

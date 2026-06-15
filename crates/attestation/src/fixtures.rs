@@ -1,6 +1,5 @@
 //! Attestation fixtures.
 use tlsn_core::{
-    connection::{CertBinding, CertBindingV1_2},
     fixtures::ConnectionFixture,
     transcript::{Transcript, TranscriptCommitConfigBuilder, TranscriptCommitment},
 };
@@ -77,14 +76,6 @@ pub fn attestation_fixture(
         ..
     } = connection;
 
-    let CertBinding::V1_2(CertBindingV1_2 {
-        server_ephemeral_key,
-        ..
-    }) = server_cert_data.binding
-    else {
-        panic!("expected v1.2 binding data");
-    };
-
     let mut provider = CryptoProvider::default();
     match signature_alg {
         SignatureAlgId::SECP256K1 => provider.signer.set_secp256k1(&[42u8; 32]).unwrap(),
@@ -104,7 +95,7 @@ pub fn attestation_fixture(
 
     attestation_builder
         .connection_info(connection_info)
-        .server_ephemeral_key(server_ephemeral_key)
+        .cert_binding(server_cert_data.binding)
         .transcript_commitments(transcript_commitments.to_vec());
 
     attestation_builder.build(&provider).unwrap()

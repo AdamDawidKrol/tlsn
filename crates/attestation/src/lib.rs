@@ -229,7 +229,7 @@ use rand::distr::{Distribution, StandardUniform};
 use serde::{Deserialize, Serialize};
 
 use tlsn_core::{
-    connection::{ConnectionInfo, ServerEphemKey},
+    connection::{CertBinding, ConnectionInfo},
     hash::{Hash, HashAlgorithm, TypedHash},
     merkle::MerkleTree,
     transcript::TranscriptCommitment,
@@ -250,7 +250,7 @@ pub use proof::{AttestationError, AttestationProof};
 pub use provider::CryptoProvider;
 pub use secrets::Secrets;
 /// Current version of attestations.
-pub const VERSION: Version = Version(0);
+pub const VERSION: Version = Version(1);
 
 /// Unique identifier for an attestation.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -310,8 +310,8 @@ impl fmt::Display for FieldId {
 pub enum FieldKind {
     /// Connection information.
     ConnectionInfo = 0x01,
-    /// Server ephemeral key.
-    ServerEphemKey = 0x02,
+    /// Certificate binding.
+    CertBinding = 0x02,
     /// Server identity commitment.
     ServerIdentityCommitment = 0x03,
     /// Plaintext hash commitment.
@@ -336,7 +336,7 @@ impl_domain_separator!(Header);
 pub struct Body {
     verifying_key: Field<VerifyingKey>,
     connection_info: Field<ConnectionInfo>,
-    server_ephemeral_key: Field<ServerEphemKey>,
+    cert_binding: Field<CertBinding>,
     cert_commitment: Field<ServerCertCommitment>,
     extensions: Vec<Field<Extension>>,
     transcript_commitments: Vec<Field<TranscriptCommitment>>,
@@ -381,7 +381,7 @@ impl Body {
         let Self {
             verifying_key,
             connection_info: conn_info,
-            server_ephemeral_key,
+            cert_binding,
             cert_commitment,
             extensions,
             transcript_commitments,
@@ -391,8 +391,8 @@ impl Body {
             (verifying_key.id, hasher.hash_separated(&verifying_key.data)),
             (conn_info.id, hasher.hash_separated(&conn_info.data)),
             (
-                server_ephemeral_key.id,
-                hasher.hash_separated(&server_ephemeral_key.data),
+                cert_binding.id,
+                hasher.hash_separated(&cert_binding.data),
             ),
             (
                 cert_commitment.id,
@@ -417,9 +417,9 @@ impl Body {
         &self.connection_info.data
     }
 
-    /// Returns the server's ephemeral public key.
-    pub(crate) fn server_ephemeral_key(&self) -> &ServerEphemKey {
-        &self.server_ephemeral_key.data
+    /// Returns the certificate binding.
+    pub(crate) fn cert_binding(&self) -> &CertBinding {
+        &self.cert_binding.data
     }
 
     /// Returns the commitment to a server certificate.

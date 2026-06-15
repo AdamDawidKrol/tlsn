@@ -80,7 +80,7 @@ impl Presentation {
                 identity.verify_with_provider(
                     provider,
                     attestation.body.connection_info().time,
-                    attestation.body.server_ephemeral_key(),
+                    attestation.body.cert_binding(),
                     attestation.body.cert_commitment(),
                 )
             })

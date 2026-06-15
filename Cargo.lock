@@ -5975,12 +5975,14 @@ dependencies = [
  "rand 0.9.4",
  "rand06-compat",
  "rangeset",
+ "ring",
  "rstest",
  "serde",
  "thiserror 1.0.69",
  "tiny-keccak",
  "tlsn-core",
  "tlsn-data-fixtures",
+ "tlsn-server-fixture-certs",
  "tlsn-tls-core",
 ]
 

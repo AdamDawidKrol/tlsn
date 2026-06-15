@@ -32,7 +32,6 @@ use tlsn_attestation::{
     signing::SignatureAlgId,
 };
 use tlsn_core::{
-    connection::{CertBinding, CertBindingV1_2},
     fixtures::ConnectionFixture,
     hash::{Blake3, Blinder, HashAlgId},
     transcript::{
@@ -56,13 +55,7 @@ fn main() {
         server_cert_data,
     } = ConnectionFixture::tlsnotary(transcript.length());
 
-    let CertBinding::V1_2(CertBindingV1_2 {
-        server_ephemeral_key,
-        ..
-    }) = server_cert_data.binding.clone()
-    else {
-        unreachable!()
-    };
+    let cert_binding = server_cert_data.binding.clone();
 
     let hasher = Blake3::default();
     let sent_blinder: Blinder = rng.random();
@@ -128,7 +121,7 @@ fn main() {
 
     attestation_builder
         .connection_info(connection_info)
-        .server_ephemeral_key(server_ephemeral_key)
+        .cert_binding(cert_binding)
         .transcript_commitments(vec![
             TranscriptCommitment::Hash(sent_hash_commitment),
             TranscriptCommitment::Hash(recv_hash_commitment),

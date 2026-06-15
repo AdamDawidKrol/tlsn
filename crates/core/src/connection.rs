@@ -258,7 +258,7 @@ pub struct TranscriptLength {
 }
 
 /// TLS 1.2 certificate binding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertBindingV1_2 {
     /// Client random.
     pub client_random: [u8; 32],
@@ -279,7 +279,7 @@ pub enum SignatureScheme13 {
 }
 
 /// TLS 1.3 certificate binding.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CertBindingV1_3 {
     /// Transcript hash H(ClientHello .. Certificate) — the input the server
     /// signs in CertificateVerify (RFC 8446 §4.4.3).
@@ -299,7 +299,7 @@ pub struct CertBindingV1_3 {
 /// parameters ([`CertBinding::V1_2`]). In TLS 1.3 the server signs the running
 /// handshake transcript hash in CertificateVerify ([`CertBinding::V1_3`]); the
 /// ephemeral key does not participate in authentication.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum CertBinding {
