@@ -5890,6 +5890,7 @@ name = "tlsn"
 version = "0.1.0-alpha.16-pre"
 dependencies = [
  "aes 0.8.4",
+ "bincode",
  "ctr 0.9.2",
  "futures",
  "futures-plex",
@@ -5906,12 +5907,14 @@ dependencies = [
  "mpz-memory-core",
  "mpz-ole",
  "mpz-ot",
+ "mpz-ot-core",
  "mpz-vm-core",
  "mpz-zk",
  "once_cell",
  "opaque-debug",
  "pin-project-lite",
  "rand 0.9.4",
+ "rand_chacha 0.9.0",
  "rangeset",
  "rstest",
  "rustls 0.23.40",

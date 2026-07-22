@@ -77,3 +77,6 @@ tokio-util = { workspace = true, features = ["compat"] }
 hyper = { workspace = true, features = ["client"] }
 http-body-util = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
+mpz-ot-core = { git = "https://github.com/privacy-ethereum/mpz", rev = "v0.1.0-alpha.6" }
+bincode = { workspace = true }
+rand_chacha = { workspace = true }
