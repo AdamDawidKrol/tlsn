@@ -67,6 +67,11 @@ web-time = { workspace = true }
 
 [dev-dependencies]
 mpz-ideal-vm = { workspace = true }
+mpz-ot-core = { workspace = true }
+mpz-core = { workspace = true }
+bincode = { workspace = true }
+rand = { workspace = true }
+rand_chacha = { workspace = true }
 rstest = { workspace = true }
 tlsn-core = { workspace = true, features = ["fixtures"] }
 tlsn-server-fixture = { workspace = true }
